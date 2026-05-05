@@ -371,9 +371,9 @@ async def upload_835(file: UploadFile = File(...)):
     auto_retrain_triggered = False
     training_status = None
 
-    total_matched = await db.claims.count_documents({"actual_outcome": {"$exists": True}})
+    total_training = await db.ml_training_data.count_documents({})
 
-    if total_matched >= AUTO_RETRAIN_THRESHOLD:
+    if total_training >= AUTO_RETRAIN_THRESHOLD:
         last = await db.training_history.find_one(sort=[("trained_at", -1)])
         cooldown_ok = (
             not last
@@ -385,15 +385,15 @@ async def upload_835(file: UploadFile = File(...)):
                 asyncio.create_task(retrain_model(db))
                 auto_retrain_triggered = True
                 training_status = "retraining_in_background"
-                logger.info("Auto-retrain triggered", matched=total_matched)
+                logger.info("Auto-retrain triggered", training_records=total_training)
             else:
                 training_status = "retrain_skipped_quality"
                 logger.warning("Auto-retrain skipped: quality check failed", issues=quality["issues"])
         else:
             training_status = "retrain_cooldown"
     else:
-        claims_until = AUTO_RETRAIN_THRESHOLD - total_matched
-        training_status = f"need_{claims_until}_more_matches"
+        records_until = AUTO_RETRAIN_THRESHOLD - total_training
+        training_status = f"need_{records_until}_more_training_records"
 
     return {
         "message": f"Parsed {len(remittances)} remittance records from 835 file",
@@ -402,9 +402,11 @@ async def upload_835(file: UploadFile = File(...)):
         "matched_to_claims": summary["matched"],
         "denied_count": summary["denied"],
         "total_paid": summary["total_paid"],
+        "training_records_created": summary.get("training_records_created", 0),
+        "total_training_records": summary.get("total_training_records", 0),
         "training_status": training_status,
         "auto_retrain_triggered": auto_retrain_triggered,
-        "total_matched_claims": total_matched,
-        "ready_to_retrain": total_matched >= AUTO_RETRAIN_THRESHOLD,
-        "claims_until_retrain": max(0, AUTO_RETRAIN_THRESHOLD - total_matched),
+        "total_matched_claims": summary.get("total_matched_claims", 0),
+        "ready_to_retrain": total_training >= AUTO_RETRAIN_THRESHOLD,
+        "records_until_retrain": max(0, AUTO_RETRAIN_THRESHOLD - total_training),
     }

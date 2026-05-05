@@ -576,6 +576,9 @@ export default function UploadPage() {
                 <p>Matched to claims: {result835.matched_to_claims}</p>
                 <p>Denied: {result835.denied_count}</p>
                 <p>Total paid: ${result835.total_paid?.toLocaleString()}</p>
+                {result835.training_records_created != null && (
+                  <p>Training records created: {result835.training_records_created}</p>
+                )}
                 {result835.total_matched_claims != null && (
                   <p>Total matched claims: {result835.total_matched_claims}</p>
                 )}
@@ -593,7 +596,7 @@ export default function UploadPage() {
                   ) : result835.ready_to_retrain ? (
                     <p>Ready to retrain model</p>
                   ) : (
-                    <p>{result835.claims_until_retrain} more matched claims needed for auto-retrain</p>
+                    <p>{result835.records_until_retrain} more training records needed for auto-retrain</p>
                   )}
                 </div>
               )}

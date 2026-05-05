@@ -47,6 +47,49 @@ def _enrich_carc_descriptions(carc_codes: list[str]) -> list[dict]:
     ]
 
 
+async def _create_training_record(
+    db,
+    claim_id: str,
+    remit,
+    claim: dict,
+) -> bool:
+    """Join prediction features with 835 outcome into ml_training_data.
+
+    Returns True if a record was created/updated, False otherwise.
+    """
+    # Look up stored prediction with features
+    prediction = await db.predictions.find_one({"claim_id": claim_id})
+    if not prediction or not prediction.get("features"):
+        logger.debug("No prediction features for training join", claim_id=claim_id)
+        return False
+
+    label = 1 if remit.claim_status == "denied" else 0
+    first_carc = remit.carc_codes[0] if remit.carc_codes else None
+
+    training_doc = {
+        "claim_id": claim_id,
+        "features": prediction["features"],
+        "label": label,
+        "actual_outcome": remit.claim_status,
+        "denial_code": first_carc,
+        "denial_code_description": CARC_DESCRIPTIONS.get(first_carc, "Unknown") if first_carc else None,
+        "all_carc_codes": remit.carc_codes,
+        "paid_amount": remit.paid_amount,
+        "billed_amount": remit.billed_amount,
+        "model_version_at_prediction": prediction.get("model_version", "unknown"),
+        "prediction_risk_score": prediction.get("risk_score"),
+        "created_at": datetime.utcnow(),
+    }
+
+    await db.ml_training_data.update_one(
+        {"claim_id": claim_id},
+        {"$set": training_doc},
+        upsert=True,
+    )
+    logger.info("Training record created", claim_id=claim_id, label=label)
+    return True
+
+
 async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
     """Insert parsed 835 remittance records. Returns summary."""
     db = get_db()
@@ -54,6 +97,7 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
     matched = 0
     denied = 0
     new_outcomes = 0
+    training_records_created = 0
 
     for remit in remittances:
         doc = remit.model_dump()
@@ -84,6 +128,14 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
             )
             matched += 1
             logger.info("Matched 835 to claim", claim_id=remit.claim_id, status=remit.claim_status)
+
+            # ── Training data join: prediction features + 835 outcome ──
+            try:
+                created = await _create_training_record(db, remit.claim_id, remit, claim)
+                if created:
+                    training_records_created += 1
+            except Exception as e:
+                logger.warning("Failed to create training record", claim_id=remit.claim_id, error=str(e))
 
             # ── Knowledge layer: record fix outcomes ──
             validation_issues = claim.get("validation_issues", [])
@@ -117,6 +169,7 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
                     logger.warning("Failed to record fix", error=str(e))
 
     total_matched = await db.claims.count_documents({"actual_outcome": {"$exists": True}})
+    total_training = await db.ml_training_data.count_documents({})
 
     return {
         "inserted": inserted,
@@ -125,6 +178,8 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
         "new_outcomes": new_outcomes,
         "total_paid": sum(r.paid_amount for r in remittances),
         "total_matched_claims": total_matched,
+        "training_records_created": training_records_created,
+        "total_training_records": total_training,
     }
 
 

@@ -1,14 +1,14 @@
 """
-Retrain XGBoost model using real matched 837+835 data from MongoDB.
+Retrain XGBoost model using pre-joined ml_training_data from MongoDB.
 
-This module pulls claims that have been matched to 835 outcomes
-(actual_outcome = "paid" or "denied"), extracts features, and
-trains a new XGBoost model. Falls back to augmenting with synthetic
-data if real samples are too few.
+The ml_training_data collection contains prediction features joined with
+835 outcomes — no feature recomputation needed. Model versions are tracked
+in the model_registry collection.
 """
 
 from __future__ import annotations
 
+import shutil
 import time
 from datetime import datetime
 from pathlib import Path
@@ -22,78 +22,85 @@ from sklearn.metrics import roc_auc_score, precision_score, recall_score
 from xgboost import XGBClassifier
 
 from app.config import settings
-from app.core.feature_engineer import (
-    compute_features_from_claim,
-    FEATURE_NAMES,
-)
+from app.core.feature_engineer import FEATURE_NAMES
 
 logger = structlog.get_logger()
 
-MIN_REAL_SAMPLES = 30       # minimum real matched claims to attempt training
+MIN_REAL_SAMPLES = 30       # minimum real training records to attempt training
 SYNTHETIC_FILL_TARGET = 2000  # if real < this, pad with synthetic
-AUTO_RETRAIN_THRESHOLD = 5000  # matched claims to trigger auto-retrain
+AUTO_RETRAIN_THRESHOLD = 5000  # training records to trigger auto-retrain
 AUTO_RETRAIN_INTERVAL_DAYS = 7  # minimum days between auto-retrains
+
+
+async def _get_next_model_version(db) -> int:
+    """Read latest version from model_registry, return next int (1 if first)."""
+    latest = await db.model_registry.find_one(
+        sort=[("version", -1)],
+    )
+    if latest:
+        return latest["version"] + 1
+    return 1
 
 
 async def retrain_model(db) -> dict:
     """
-    Pull real matched data from MongoDB, train XGBoost, save model.
-    Returns training summary dict.
+    Read pre-joined training data from ml_training_data, train XGBoost,
+    save versioned model. Returns training summary dict.
     """
     start = time.time()
 
-    # ── 1. Pull all claims with actual outcomes ──
-    cursor = db.claims.find(
-        {"actual_outcome": {"$in": ["paid", "denied"]}},
-    )
+    # ── 1. Pull all training records from ml_training_data ──
+    cursor = db.ml_training_data.find({})
     real_docs = await cursor.to_list(length=100_000)
     real_count = len(real_docs)
 
-    logger.info("Retrain: found matched claims", count=real_count)
+    logger.info("Retrain: found training records", count=real_count)
 
     if real_count < MIN_REAL_SAMPLES:
         return {
             "status": "insufficient_data",
-            "message": f"Need at least {MIN_REAL_SAMPLES} matched claims (have {real_count}). "
-                       f"Upload more 835 files to match outcomes to claims.",
-            "matched_claims": real_count,
+            "message": f"Need at least {MIN_REAL_SAMPLES} training records (have {real_count}). "
+                       f"Upload more 835 files to build training data.",
+            "training_records": real_count,
         }
 
-    # ── 2. Extract features + labels from real data ──
+    # ── 2. Use pre-joined features + labels directly (no recomputation) ──
     real_features: list[dict] = []
     real_labels: list[int] = []
-    claim_meta: list[dict] = []  # for saving training history
+    skipped = 0
 
     for doc in real_docs:
-        feats = compute_features_from_claim(doc)
+        features = doc.get("features")
+        if not features:
+            skipped += 1
+            continue
+        real_features.append(features)
+        real_labels.append(doc["label"])
 
-        # Enrich with historical rates from remittances (sync approximation)
-        payer_name = doc.get("payer_name", "")
-        npi = doc.get("billing_provider_npi", "")
-        service_lines = doc.get("service_lines", [])
-        primary_cpt = service_lines[0].get("cpt_code", "") if service_lines else ""
+    if skipped:
+        logger.warning("Retrain: skipped records with empty features", count=skipped)
 
-        # Compute denial rates from the matched data itself
-        feats["payer_denial_rate"] = await _compute_rate(db, "payer_name", payer_name)
-        feats["cpt_denial_rate"] = await _compute_cpt_rate(db, primary_cpt)
-        feats["provider_denial_rate"] = await _compute_rate(db, "billing_provider_npi", npi)
-
-        real_features.append(feats)
-        label = 1 if doc.get("actual_outcome") == "denied" else 0
-        real_labels.append(label)
-
-        claim_meta.append({
-            "claim_id": doc.get("claim_id"),
-            "patient_name": f"{doc.get('patient_first_name', '')} {doc.get('patient_last_name', '')}".strip(),
-            "actual_outcome": doc.get("actual_outcome"),
-            "issue_count": doc.get("issue_count", 0),
-        })
+    real_count = len(real_features)
+    if real_count < MIN_REAL_SAMPLES:
+        return {
+            "status": "insufficient_data",
+            "message": f"Only {real_count} records have features (need {MIN_REAL_SAMPLES}).",
+            "training_records": real_count,
+        }
 
     df_real = pd.DataFrame(real_features, columns=FEATURE_NAMES).fillna(0.0)
     y_real = np.array(real_labels)
 
     denied_count = int(y_real.sum())
     paid_count = int(len(y_real) - denied_count)
+
+    # Collect top denial codes for training record
+    denial_code_counts: dict[str, int] = {}
+    for doc in real_docs:
+        code = doc.get("denial_code")
+        if code and doc.get("label") == 1:
+            denial_code_counts[code] = denial_code_counts.get(code, 0) + 1
+    top_denial_codes = sorted(denial_code_counts.items(), key=lambda x: -x[1])[:10]
 
     logger.info("Retrain: real data stats",
                 total=real_count, denied=denied_count, paid=paid_count,
@@ -156,76 +163,113 @@ async def retrain_model(db) -> dict:
                 auc=f"{auc:.4f}", precision=f"{precision:.4f}",
                 recall=f"{recall:.4f}", auc_real=auc_real)
 
-    # ── 7. Save model ──
+    # ── 7. Save versioned model ──
     model_dir = Path(settings.MODEL_DIR)
     model_dir.mkdir(exist_ok=True)
 
-    # Backup old model
-    old_model = model_dir / "demo_model.joblib"
-    if old_model.exists():
-        backup_name = f"demo_model_backup_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}.joblib"
-        old_model.rename(model_dir / backup_name)
-        logger.info("Retrain: backed up old model", name=backup_name)
+    version_num = await _get_next_model_version(db)
+    version_str = f"v{version_num}"
+    versioned_path = model_dir / f"model_{version_str}.joblib"
+    joblib.dump(model, versioned_path)
+    logger.info("Retrain: saved versioned model", path=str(versioned_path), version=version_str)
 
-    model_path = model_dir / "demo_model.joblib"
-    joblib.dump(model, model_path)
-    logger.info("Retrain: saved new model", path=str(model_path))
+    # Copy to demo_model.joblib for backward compatibility
+    demo_path = model_dir / "demo_model.joblib"
+    shutil.copy2(str(versioned_path), str(demo_path))
 
-    # ── 8. Save training record to MongoDB ──
+    # ── 8. Save training record + model registry ──
     elapsed = round(time.time() - start, 2)
-    from app.core.predictor import get_model_version
+
+    metrics = {
+        "auc_roc": round(auc, 4),
+        "precision": round(precision, 4),
+        "recall": round(recall, 4),
+        "auc_real_only": round(auc_real, 4) if auc_real else None,
+    }
+    feature_importance = {
+        name: round(float(imp), 4)
+        for name, imp in zip(FEATURE_NAMES, model.feature_importances_)
+    }
+
     training_record = {
         "trained_at": datetime.utcnow(),
-        "model_version": get_model_version(),
+        "model_version": version_str,
         "real_samples": real_count,
         "synthetic_samples": synthetic_count,
         "total_samples": len(df_train),
         "denied_count": denied_count,
         "paid_count": paid_count,
         "denial_rate": round(denied_count / real_count, 4),
-        "metrics": {
-            "auc_roc": round(auc, 4),
-            "precision": round(precision, 4),
-            "recall": round(recall, 4),
-            "auc_real_only": round(auc_real, 4) if auc_real else None,
-        },
-        "feature_importance": {
-            name: round(float(imp), 4)
-            for name, imp in zip(FEATURE_NAMES, model.feature_importances_)
-        },
+        "metrics": metrics,
+        "feature_importance": feature_importance,
+        "top_denial_codes": [{"code": c, "count": n} for c, n in top_denial_codes],
         "elapsed_seconds": elapsed,
     }
     await db.training_history.insert_one(training_record)
 
-    # ── 9. Reload model in memory + refresh decision config ──
-    from app.core.predictor import load_model
+    # Mark previous versions inactive, upsert new version
+    await db.model_registry.update_many(
+        {"is_active": True},
+        {"$set": {"is_active": False}},
+    )
+    await db.model_registry.update_one(
+        {"version": version_num},
+        {"$set": {
+            "version": version_num,
+            "version_str": version_str,
+            "trained_at": datetime.utcnow(),
+            "is_active": True,
+            "model_path": str(versioned_path),
+            "real_samples": real_count,
+            "synthetic_samples": synthetic_count,
+            "metrics": metrics,
+            "feature_importance": feature_importance,
+            "top_denial_codes": [{"code": c, "count": n} for c, n in top_denial_codes],
+        }},
+        upsert=True,
+    )
+
+    # ── 9. Reload model in memory with proper version ──
+    from app.core.predictor import load_model, set_model_version
     load_model()
+    set_model_version(version_str)
     from app.services.decision_engine import load_config as load_decision_config
     await load_decision_config(db)
 
     return {
         "status": "success",
-        "message": f"Model retrained on {real_count} real + {synthetic_count} synthetic claims",
+        "model_version": version_str,
+        "message": f"Model {version_str} trained on {real_count} real + {synthetic_count} synthetic records",
         "real_samples": real_count,
         "synthetic_samples": synthetic_count,
         "denied_count": denied_count,
         "paid_count": paid_count,
         "denial_rate": round(denied_count / real_count, 4),
-        "metrics": training_record["metrics"],
-        "feature_importance": training_record["feature_importance"],
+        "metrics": metrics,
+        "feature_importance": feature_importance,
+        "top_denial_codes": [{"code": c, "count": n} for c, n in top_denial_codes],
         "elapsed_seconds": elapsed,
     }
 
 
 async def get_training_status(db) -> dict:
     """Get current training data status and last training info."""
+    total_claims = await db.claims.count_documents({})
+    total_remittances = await db.remittances.count_documents({})
     matched = await db.claims.count_documents(
         {"actual_outcome": {"$in": ["paid", "denied"]}}
     )
-    denied = await db.claims.count_documents({"actual_outcome": "denied"})
-    paid = await db.claims.count_documents({"actual_outcome": "paid"})
-    total_claims = await db.claims.count_documents({})
-    total_remittances = await db.remittances.count_documents({})
+
+    # ml_training_data stats
+    training_total = await db.ml_training_data.count_documents({})
+    training_denied = await db.ml_training_data.count_documents({"label": 1})
+    training_paid = training_total - training_denied
+
+    # Active model version
+    active_model = await db.model_registry.find_one({"is_active": True})
+
+    # Gap analysis: matched claims vs training records
+    gap = matched - training_total
 
     # Last training
     last = await db.training_history.find_one(sort=[("trained_at", -1)])
@@ -234,12 +278,29 @@ async def get_training_status(db) -> dict:
         "total_claims": total_claims,
         "total_remittances": total_remittances,
         "matched_claims": matched,
-        "paid_count": paid,
-        "denied_count": denied,
-        "ready_to_train": matched >= MIN_REAL_SAMPLES,
+        "training_data": {
+            "total": training_total,
+            "denied": training_denied,
+            "paid": training_paid,
+            "denial_rate": round(training_denied / max(training_total, 1), 4),
+        },
+        "gap_analysis": {
+            "matched_claims": matched,
+            "training_records": training_total,
+            "gap": gap,
+            "message": f"{gap} matched claims not yet in training data" if gap > 0
+                       else "All matched claims have training records",
+        },
+        "active_model": {
+            "version": active_model["version_str"],
+            "trained_at": active_model["trained_at"].isoformat(),
+            "metrics": active_model.get("metrics"),
+        } if active_model else None,
+        "ready_to_train": training_total >= MIN_REAL_SAMPLES,
         "min_required": MIN_REAL_SAMPLES,
         "last_training": {
             "trained_at": last["trained_at"].isoformat() if last else None,
+            "model_version": last.get("model_version") if last else None,
             "real_samples": last.get("real_samples") if last else None,
             "metrics": last.get("metrics") if last else None,
         } if last else None,
@@ -249,50 +310,39 @@ async def get_training_status(db) -> dict:
 async def validate_training_data(db) -> dict:
     """Validate data quality BEFORE allowing retrain.
 
+    Reads from ml_training_data instead of claims.
     Prevents noisy labels from degrading the model. All gates must pass.
     """
     issues = []
 
     # 1. Check class balance
-    matched = await db.claims.count_documents({"actual_outcome": {"$exists": True}})
-    denied = await db.claims.count_documents({"actual_outcome": "denied"})
-    paid = matched - denied
-    denial_rate = denied / max(matched, 1)
+    total = await db.ml_training_data.count_documents({})
+    denied = await db.ml_training_data.count_documents({"label": 1})
+    paid = total - denied
+    denial_rate = denied / max(total, 1)
 
     if denial_rate < 0.05 or denial_rate > 0.95:
         issues.append(f"Extreme class imbalance: {denial_rate:.1%} denial rate")
 
-    # 2. Check for duplicate claim_ids
-    pipeline = [
-        {"$match": {"actual_outcome": {"$exists": True}}},
-        {"$group": {"_id": "$claim_id", "count": {"$sum": 1}}},
-        {"$match": {"count": {"$gt": 1}}},
-        {"$count": "duplicates"},
-    ]
-    dups = await db.claims.aggregate(pipeline).to_list(1)
-    if dups and dups[0]["duplicates"] > matched * 0.05:
-        issues.append(f"Too many duplicate claim_ids: {dups[0]['duplicates']}")
-
-    # 3. Check for missing features on matched claims
-    missing_feat = await db.claims.count_documents({
-        "actual_outcome": {"$exists": True},
+    # 2. Check for empty features
+    empty_feats = await db.ml_training_data.count_documents({
         "$or": [
-            {"service_lines": {"$size": 0}},
-            {"service_lines": {"$exists": False}},
+            {"features": {"$exists": False}},
+            {"features": {}},
         ],
     })
-    if missing_feat > matched * 0.1:
-        issues.append(f"{missing_feat} claims have no service lines (>{10}% of data)")
+    if empty_feats > total * 0.1:
+        issues.append(f"{empty_feats} records have empty features (>{10}% of data)")
 
-    # 4. Minimum sample size
-    if matched < MIN_REAL_SAMPLES:
-        issues.append(f"Only {matched} matched claims (need {MIN_REAL_SAMPLES})")
+    # 3. Minimum sample size
+    if total < MIN_REAL_SAMPLES:
+        issues.append(f"Only {total} training records (need {MIN_REAL_SAMPLES})")
 
     return {
         "passed": len(issues) == 0,
         "issues": issues,
         "stats": {
-            "matched": matched,
+            "total": total,
             "denied": denied,
             "paid": paid,
             "denial_rate": round(denial_rate, 4),
@@ -301,41 +351,6 @@ async def validate_training_data(db) -> dict:
 
 
 # ── Helpers ──
-
-async def _compute_rate(db, field: str, value: str) -> float:
-    """Compute denial rate for a field value from matched claims."""
-    if not value:
-        return 0.0
-    total = await db.claims.count_documents({
-        field: value, "actual_outcome": {"$exists": True}
-    })
-    if total == 0:
-        return 0.0
-    denied = await db.claims.count_documents({
-        field: value, "actual_outcome": "denied"
-    })
-    return denied / total
-
-
-async def _compute_cpt_rate(db, cpt_code: str) -> float:
-    """Compute denial rate for a CPT code from matched remittances."""
-    if not cpt_code:
-        return 0.0
-    pipeline = [
-        {"$match": {"actual_outcome": {"$exists": True}}},
-        {"$unwind": "$service_lines"},
-        {"$match": {"service_lines.cpt_code": cpt_code}},
-        {"$group": {
-            "_id": None,
-            "total": {"$sum": 1},
-            "denied": {"$sum": {"$cond": [{"$eq": ["$actual_outcome", "denied"]}, 1, 0]}},
-        }},
-    ]
-    result = await db.claims.aggregate(pipeline).to_list(1)
-    if result and result[0]["total"] > 0:
-        return result[0]["denied"] / result[0]["total"]
-    return 0.0
-
 
 def _generate_synthetic(n: int, seed: int = 42) -> tuple[pd.DataFrame, np.ndarray]:
     """Generate synthetic training data to augment small real datasets."""

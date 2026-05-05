@@ -28,6 +28,10 @@ async def connect_db() -> None:
     # Knowledge layer indexes
     await _db.fix_history.create_index([("payer_name", 1), ("issue_type", 1)])
     await _db.fix_history.create_index("cpt_code")
+    # ML training loop indexes
+    await _db.ml_training_data.create_index("claim_id", unique=True)
+    await _db.ml_training_data.create_index("label")
+    await _db.model_registry.create_index("version", unique=True)
     logger.info("Connected to MongoDB", db=settings.MONGO_DB)
 
 

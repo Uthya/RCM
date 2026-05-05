@@ -182,9 +182,11 @@ export interface UploadResponse {
   matched_to_claims?: number;
   denied_count?: number;
   total_paid?: number;
+  training_records_created?: number;
+  total_training_records?: number;
   training_status?: string;
   auto_retrain_triggered?: boolean;
   total_matched_claims?: number;
   ready_to_retrain?: boolean;
-  claims_until_retrain?: number;
+  records_until_retrain?: number;
 }

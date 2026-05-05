@@ -1,5 +1,7 @@
 """XGBoost model wrapper for denial prediction."""
 
+import glob as glob_mod
+import re
 from pathlib import Path
 
 import joblib
@@ -16,6 +18,44 @@ _model_loaded = False
 _model_version: str = "unknown"
 
 
+def _detect_version_from_files() -> str:
+    """Scan model_v*.joblib files to detect latest version.
+
+    Falls back to mtime-based version if no versioned files exist.
+    """
+    model_dir = Path(settings.MODEL_DIR)
+    pattern = str(model_dir / "model_v*.joblib")
+    versioned_files = glob_mod.glob(pattern)
+
+    if versioned_files:
+        # Extract version numbers and find the highest
+        max_version = 0
+        for f in versioned_files:
+            match = re.search(r"model_v(\d+)\.joblib$", f)
+            if match:
+                v = int(match.group(1))
+                if v > max_version:
+                    max_version = v
+        if max_version > 0:
+            return f"v{max_version}"
+
+    # Fallback: use mtime of demo_model.joblib
+    demo_path = model_dir / "demo_model.joblib"
+    if demo_path.exists():
+        mtime = demo_path.stat().st_mtime
+        from datetime import datetime
+        return datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+
+    return "fallback"
+
+
+def set_model_version(version: str) -> None:
+    """Set model version explicitly (called by retrain_model after saving)."""
+    global _model_version
+    _model_version = version
+    logger.info("Model version set", version=version)
+
+
 def load_model() -> None:
     """Load XGBoost model from disk."""
     global _model, _model_loaded, _model_version
@@ -24,10 +64,7 @@ def load_model() -> None:
     if model_path.exists():
         _model = joblib.load(model_path)
         _model_loaded = True
-        # Track model version from file modification time
-        mtime = model_path.stat().st_mtime
-        from datetime import datetime
-        _model_version = datetime.fromtimestamp(mtime).strftime("%Y%m%d_%H%M%S")
+        _model_version = _detect_version_from_files()
         logger.info("XGBoost model loaded", path=str(model_path), version=_model_version)
         # Initialize SHAP explainer
         try:
