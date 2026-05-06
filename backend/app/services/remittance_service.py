@@ -265,9 +265,15 @@ async def get_remittances(
 async def get_remittance(remittance_id: str) -> RemittanceResponse | None:
     """Get single remittance by MongoDB _id."""
     from bson import ObjectId
+    from bson.errors import InvalidId
     db = get_db()
 
-    doc = await db.remittances.find_one({"_id": ObjectId(remittance_id)})
+    try:
+        oid = ObjectId(remittance_id)
+    except (InvalidId, TypeError):
+        return None
+
+    doc = await db.remittances.find_one({"_id": oid})
     if not doc:
         return None
 
