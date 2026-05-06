@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import shutil
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import joblib
@@ -30,6 +30,7 @@ MIN_REAL_SAMPLES = 30       # minimum real training records to attempt training
 SYNTHETIC_FILL_TARGET = 2000  # if real < this, pad with synthetic
 AUTO_RETRAIN_THRESHOLD = 5000  # training records to trigger auto-retrain
 AUTO_RETRAIN_INTERVAL_DAYS = 7  # minimum days between auto-retrains
+DEFAULT_TRAINING_WINDOW_DAYS = 180  # default time window for training data
 
 
 async def _get_next_model_version(db) -> int:
@@ -42,19 +43,41 @@ async def _get_next_model_version(db) -> int:
     return 1
 
 
-async def retrain_model(db) -> dict:
+async def retrain_model(db, training_window_days: int = DEFAULT_TRAINING_WINDOW_DAYS) -> dict:
     """
     Read pre-joined training data from ml_training_data, train XGBoost,
     save versioned model. Returns training summary dict.
+
+    Args:
+        training_window_days: Only use training records created within this many
+            days. Falls back to all data if the windowed set is too small.
     """
     start = time.time()
 
-    # ── 1. Pull all training records from ml_training_data ──
-    cursor = db.ml_training_data.find({})
+    # ── 1. Pull training records from ml_training_data (time-windowed) ──
+    cutoff = datetime.utcnow() - timedelta(days=training_window_days)
+    windowed_query = {"created_at": {"$gte": cutoff}}
+    cursor = db.ml_training_data.find(windowed_query)
     real_docs = await cursor.to_list(length=100_000)
     real_count = len(real_docs)
+    used_window = True
 
-    logger.info("Retrain: found training records", count=real_count)
+    # Fallback: if windowed data is too small, use all records
+    if real_count < MIN_REAL_SAMPLES:
+        logger.warning(
+            "Retrain: windowed data insufficient, falling back to all records",
+            windowed_count=real_count,
+            window_days=training_window_days,
+        )
+        cursor = db.ml_training_data.find({})
+        real_docs = await cursor.to_list(length=100_000)
+        real_count = len(real_docs)
+        used_window = False
+
+    logger.info("Retrain: found training records",
+                count=real_count,
+                window_days=training_window_days if used_window else None,
+                used_window=used_window)
 
     if real_count < MIN_REAL_SAMPLES:
         return {
@@ -173,9 +196,7 @@ async def retrain_model(db) -> dict:
     joblib.dump(model, versioned_path)
     logger.info("Retrain: saved versioned model", path=str(versioned_path), version=version_str)
 
-    # Copy to demo_model.joblib for backward compatibility
-    demo_path = model_dir / "demo_model.joblib"
-    shutil.copy2(str(versioned_path), str(demo_path))
+    # NOTE: No longer copy to demo_model.joblib here — that happens on promote_model()
 
     # ── 8. Save training record + model registry ──
     elapsed = round(time.time() - start, 2)
@@ -200,6 +221,8 @@ async def retrain_model(db) -> dict:
         "denied_count": denied_count,
         "paid_count": paid_count,
         "denial_rate": round(denied_count / real_count, 4),
+        "training_window_days": training_window_days if used_window else None,
+        "used_full_dataset": not used_window,
         "metrics": metrics,
         "feature_importance": feature_importance,
         "top_denial_codes": [{"code": c, "count": n} for c, n in top_denial_codes],
@@ -207,18 +230,15 @@ async def retrain_model(db) -> dict:
     }
     await db.training_history.insert_one(training_record)
 
-    # Mark previous versions inactive, upsert new version
-    await db.model_registry.update_many(
-        {"is_active": True},
-        {"$set": {"is_active": False}},
-    )
+    # Register new model as candidate (NOT active) — requires explicit promotion
     await db.model_registry.update_one(
         {"version": version_num},
         {"$set": {
             "version": version_num,
             "version_str": version_str,
             "trained_at": datetime.utcnow(),
-            "is_active": True,
+            "is_active": False,
+            "status": "candidate",
             "model_path": str(versioned_path),
             "real_samples": real_count,
             "synthetic_samples": synthetic_count,
@@ -229,22 +249,29 @@ async def retrain_model(db) -> dict:
         upsert=True,
     )
 
-    # ── 9. Reload model in memory with proper version ──
-    from app.core.predictor import load_model, set_model_version
-    load_model()
-    set_model_version(version_str)
-    from app.services.decision_engine import load_config as load_decision_config
-    await load_decision_config(db)
+    logger.info("Retrain: model saved as candidate (not promoted)",
+                version=version_str)
 
+    # ── 9. Load as shadow model for comparison scoring ──
+    from app.core.predictor import load_shadow_model
+    load_shadow_model(str(versioned_path), version_str)
+
+    window_note = f" (last {training_window_days} days)" if used_window else " (all data — window fallback)"
     return {
-        "status": "success",
+        "status": "candidate",
         "model_version": version_str,
-        "message": f"Model {version_str} trained on {real_count} real + {synthetic_count} synthetic records",
+        "message": (
+            f"Model {version_str} trained on {real_count} real + "
+            f"{synthetic_count} synthetic records{window_note}. "
+            f"Loaded as shadow model — call POST /model/promote/{version_num} to activate."
+        ),
         "real_samples": real_count,
         "synthetic_samples": synthetic_count,
         "denied_count": denied_count,
         "paid_count": paid_count,
         "denial_rate": round(denied_count / real_count, 4),
+        "training_window_days": training_window_days if used_window else None,
+        "used_full_dataset": not used_window,
         "metrics": metrics,
         "feature_importance": feature_importance,
         "top_denial_codes": [{"code": c, "count": n} for c, n in top_denial_codes],
@@ -347,6 +374,131 @@ async def validate_training_data(db) -> dict:
             "paid": paid,
             "denial_rate": round(denial_rate, 4),
         },
+    }
+
+
+AUC_DROP_WARN_THRESHOLD = 0.02  # warn if new model AUC drops more than this
+
+
+async def promote_model(db, version: int, *, force: bool = False) -> dict:
+    """Promote a candidate model to active after metric comparison.
+
+    Returns a warning (not error) if AUC drops > threshold unless force=True.
+    """
+    candidate = await db.model_registry.find_one({"version": version})
+    if not candidate:
+        return {"status": "error", "message": f"Model version {version} not found"}
+
+    if candidate.get("is_active"):
+        return {"status": "error", "message": f"Model v{version} is already active"}
+
+    active = await db.model_registry.find_one({"is_active": True})
+
+    # Metric gate: warn on AUC regression
+    if active and not force:
+        active_auc = (active.get("metrics") or {}).get("auc_roc", 0)
+        candidate_auc = (candidate.get("metrics") or {}).get("auc_roc", 0)
+        if active_auc - candidate_auc > AUC_DROP_WARN_THRESHOLD:
+            return {
+                "status": "warning",
+                "message": (
+                    f"Candidate v{version} AUC ({candidate_auc:.4f}) is lower than "
+                    f"active v{active['version']} AUC ({active_auc:.4f}) by "
+                    f"{active_auc - candidate_auc:.4f}. "
+                    f"Pass force=true to promote anyway."
+                ),
+                "active_metrics": active.get("metrics"),
+                "candidate_metrics": candidate.get("metrics"),
+            }
+
+    # Deactivate current active model
+    await db.model_registry.update_many(
+        {"is_active": True},
+        {"$set": {"is_active": False, "status": "retired"}},
+    )
+
+    # Activate the candidate
+    await db.model_registry.update_one(
+        {"version": version},
+        {"$set": {"is_active": True, "status": "active", "promoted_at": datetime.utcnow()}},
+    )
+
+    # Copy model file to demo_model.joblib and reload in memory
+    model_path = candidate.get("model_path")
+    if model_path:
+        demo_path = Path(settings.MODEL_DIR) / "demo_model.joblib"
+        shutil.copy2(model_path, str(demo_path))
+
+    from app.core.predictor import load_model, set_model_version, clear_shadow_model
+    load_model()
+    set_model_version(f"v{version}")
+    clear_shadow_model()
+
+    from app.services.decision_engine import load_config as load_decision_config
+    await load_decision_config(db)
+
+    logger.info("Model promoted", version=version)
+
+    return {
+        "status": "success",
+        "message": f"Model v{version} promoted to active",
+        "promoted_version": f"v{version}",
+        "previous_active": f"v{active['version']}" if active else None,
+        "metrics": candidate.get("metrics"),
+    }
+
+
+async def rollback_model(db) -> dict:
+    """Rollback to the previous active model version."""
+    # Find the current active model
+    active = await db.model_registry.find_one({"is_active": True})
+    if not active:
+        return {"status": "error", "message": "No active model to rollback from"}
+
+    # Find the most recent retired model (previous active)
+    previous = await db.model_registry.find_one(
+        {"status": "retired"},
+        sort=[("version", -1)],
+    )
+    if not previous:
+        return {"status": "error", "message": "No previous model version to rollback to"}
+
+    # Deactivate current
+    await db.model_registry.update_one(
+        {"version": active["version"]},
+        {"$set": {"is_active": False, "status": "rolled_back"}},
+    )
+
+    # Reactivate previous
+    await db.model_registry.update_one(
+        {"version": previous["version"]},
+        {"$set": {"is_active": True, "status": "active", "promoted_at": datetime.utcnow()}},
+    )
+
+    # Copy previous model file and reload
+    model_path = previous.get("model_path")
+    if model_path:
+        demo_path = Path(settings.MODEL_DIR) / "demo_model.joblib"
+        shutil.copy2(model_path, str(demo_path))
+
+    from app.core.predictor import load_model, set_model_version, clear_shadow_model
+    load_model()
+    set_model_version(f"v{previous['version']}")
+    clear_shadow_model()
+
+    from app.services.decision_engine import load_config as load_decision_config
+    await load_decision_config(db)
+
+    logger.info("Model rolled back",
+                from_version=active["version"],
+                to_version=previous["version"])
+
+    return {
+        "status": "success",
+        "message": f"Rolled back from v{active['version']} to v{previous['version']}",
+        "rolled_back_from": f"v{active['version']}",
+        "restored_version": f"v{previous['version']}",
+        "metrics": previous.get("metrics"),
     }
 
 

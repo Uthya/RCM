@@ -17,6 +17,11 @@ _model = None
 _model_loaded = False
 _model_version: str = "unknown"
 
+# Shadow model slot for champion-challenger comparison
+_shadow_model = None
+_shadow_model_loaded = False
+_shadow_model_version: str = "none"
+
 
 def _detect_version_from_files() -> str:
     """Scan model_v*.joblib files to detect latest version.
@@ -97,6 +102,46 @@ def predict_proba(X: pd.DataFrame) -> np.ndarray:
 
     probas = _model.predict_proba(X)
     # Return probability of class 1 (denied)
+    return probas[:, 1]
+
+
+def load_shadow_model(model_path: str, version: str) -> None:
+    """Load a candidate model into the shadow slot for comparison scoring."""
+    global _shadow_model, _shadow_model_loaded, _shadow_model_version
+
+    path = Path(model_path)
+    if path.exists():
+        _shadow_model = joblib.load(path)
+        _shadow_model_loaded = True
+        _shadow_model_version = version
+        logger.info("Shadow model loaded", path=str(path), version=version)
+    else:
+        logger.warning("Shadow model file not found", path=str(path))
+        _shadow_model_loaded = False
+
+
+def clear_shadow_model() -> None:
+    """Clear the shadow model slot (e.g. after promotion)."""
+    global _shadow_model, _shadow_model_loaded, _shadow_model_version
+    _shadow_model = None
+    _shadow_model_loaded = False
+    _shadow_model_version = "none"
+    logger.info("Shadow model cleared")
+
+
+def is_shadow_loaded() -> bool:
+    return _shadow_model_loaded
+
+
+def get_shadow_version() -> str:
+    return _shadow_model_version
+
+
+def predict_shadow(X: pd.DataFrame) -> np.ndarray | None:
+    """Score with the shadow model. Returns None if no shadow is loaded."""
+    if _shadow_model is None:
+        return None
+    probas = _shadow_model.predict_proba(X)
     return probas[:, 1]
 
 

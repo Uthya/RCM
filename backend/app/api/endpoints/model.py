@@ -1,12 +1,16 @@
 """Model management endpoints — retrain, status, training history, versioning."""
 
 from datetime import datetime
+from typing import Optional
 
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, Query
 import structlog
 
 from app.db.mongodb import get_db
-from app.services.model_trainer import retrain_model, get_training_status
+from app.services.model_trainer import (
+    retrain_model, get_training_status, promote_model, rollback_model,
+    DEFAULT_TRAINING_WINDOW_DAYS,
+)
 from app.services.remittance_service import CARC_DESCRIPTIONS
 
 logger = structlog.get_logger()
@@ -21,10 +25,17 @@ async def training_status():
 
 
 @router.post("/retrain")
-async def retrain():
+async def retrain(
+    training_window_days: int = Query(
+        default=DEFAULT_TRAINING_WINDOW_DAYS,
+        ge=7,
+        description="Only use training records from the last N days. "
+                    "Falls back to all data if the windowed set is too small.",
+    ),
+):
     """Retrain the model using pre-joined training data from ml_training_data."""
     db = get_db()
-    result = await retrain_model(db)
+    result = await retrain_model(db, training_window_days=training_window_days)
     return result
 
 
@@ -102,6 +113,8 @@ async def model_versions():
                 "version_number": doc["version"],
                 "trained_at": doc["trained_at"].isoformat() if doc.get("trained_at") else None,
                 "is_active": doc.get("is_active", False),
+                "status": doc.get("status", "active" if doc.get("is_active") else "unknown"),
+                "promoted_at": doc["promoted_at"].isoformat() if doc.get("promoted_at") else None,
                 "real_samples": doc.get("real_samples"),
                 "synthetic_samples": doc.get("synthetic_samples"),
                 "metrics": doc.get("metrics"),
@@ -186,4 +199,114 @@ async def backfill_training_data():
         "skipped_existing": skipped_existing,
         "skipped_no_prediction": skipped_no_prediction,
         "total_training_records": total_training,
+    }
+
+
+@router.post("/promote/{version}")
+async def promote(
+    version: int,
+    force: bool = Query(
+        default=False,
+        description="Force promotion even if AUC drops below threshold",
+    ),
+):
+    """Promote a candidate model to active. Warns if metrics regress."""
+    db = get_db()
+    result = await promote_model(db, version, force=force)
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.post("/rollback")
+async def rollback():
+    """Rollback to the previous active model version."""
+    db = get_db()
+    result = await rollback_model(db)
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    return result
+
+
+@router.get("/shadow-comparison")
+async def shadow_comparison():
+    """Compare active model vs shadow model on recent predictions."""
+    from app.core.predictor import is_shadow_loaded, get_shadow_version, get_model_version
+
+    db = get_db()
+
+    if not is_shadow_loaded():
+        return {
+            "status": "no_shadow",
+            "message": "No shadow model loaded. Retrain to create a candidate.",
+        }
+
+    # Aggregate shadow prediction stats
+    shadow_docs = await db.shadow_predictions.find(
+        {}, {"shadow_score": 1, "active_score": 1, "claim_id": 1}
+    ).to_list(100_000)
+
+    if not shadow_docs:
+        return {
+            "status": "no_data",
+            "message": "Shadow model is loaded but no shadow predictions recorded yet.",
+            "active_version": get_model_version(),
+            "shadow_version": get_shadow_version(),
+        }
+
+    active_scores = [d["active_score"] for d in shadow_docs]
+    shadow_scores = [d["shadow_score"] for d in shadow_docs]
+
+    import numpy as np
+    active_arr = np.array(active_scores)
+    shadow_arr = np.array(shadow_scores)
+
+    # Compare predictions that crossed the 0.5 threshold differently
+    active_high = (active_arr >= 0.5).sum()
+    shadow_high = (shadow_arr >= 0.5).sum()
+    score_diff = float(np.mean(shadow_arr - active_arr))
+    correlation = float(np.corrcoef(active_arr, shadow_arr)[0, 1]) if len(active_arr) > 1 else None
+
+    # If we have outcomes, compute AUC for both
+    docs_with_outcome = await db.shadow_predictions.find(
+        {"actual_outcome": {"$exists": True}},
+        {"shadow_score": 1, "active_score": 1, "actual_outcome": 1},
+    ).to_list(100_000)
+
+    auc_comparison = None
+    if len(docs_with_outcome) > 10:
+        from sklearn.metrics import roc_auc_score
+        labels = [1 if d["actual_outcome"] == "denied" else 0 for d in docs_with_outcome]
+        if len(set(labels)) > 1:  # need both classes
+            active_auc = float(roc_auc_score(labels, [d["active_score"] for d in docs_with_outcome]))
+            shadow_auc = float(roc_auc_score(labels, [d["shadow_score"] for d in docs_with_outcome]))
+            auc_comparison = {
+                "active_auc": round(active_auc, 4),
+                "shadow_auc": round(shadow_auc, 4),
+                "auc_delta": round(shadow_auc - active_auc, 4),
+                "samples_with_outcome": len(docs_with_outcome),
+            }
+
+    # Get registry metrics for both models
+    active_model = await db.model_registry.find_one({"is_active": True})
+    shadow_version = get_shadow_version()
+    shadow_version_num = int(shadow_version.lstrip("v")) if shadow_version.startswith("v") else None
+    shadow_model_reg = await db.model_registry.find_one({"version": shadow_version_num}) if shadow_version_num else None
+
+    return {
+        "status": "ok",
+        "active_version": get_model_version(),
+        "shadow_version": get_shadow_version(),
+        "total_shadow_predictions": len(shadow_docs),
+        "score_comparison": {
+            "mean_score_delta": round(score_diff, 4),
+            "active_high_risk_count": int(active_high),
+            "shadow_high_risk_count": int(shadow_high),
+            "correlation": round(correlation, 4) if correlation is not None else None,
+        },
+        "auc_comparison": auc_comparison,
+        "training_metrics": {
+            "active": active_model.get("metrics") if active_model else None,
+            "shadow": shadow_model_reg.get("metrics") if shadow_model_reg else None,
+        },
     }

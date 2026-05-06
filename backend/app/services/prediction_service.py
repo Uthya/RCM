@@ -10,14 +10,37 @@ from app.core.feature_engineer import (
     enrich_with_historical_rates,
     features_to_dataframe,
 )
-from app.core.predictor import predict_proba, get_model_version
+from app.core.predictor import (
+    predict_proba, get_model_version,
+    predict_shadow, is_shadow_loaded, get_shadow_version,
+)
 from app.core.explainer import explain
 from app.schemas.prediction import DenialPrediction, PredictResponse, RiskFactor
 
 logger = structlog.get_logger()
 
+from datetime import datetime
+
 BATCH_CHUNK_SIZE = 100  # claims per prediction chunk
 BACKGROUND_THRESHOLD = 500  # claims above this run in background
+
+
+async def _log_shadow_prediction(
+    db, claim_id: str, active_score: float, shadow_score: float, model_ver: str,
+) -> None:
+    """Log shadow model prediction alongside the active score for later comparison."""
+    await db.shadow_predictions.update_one(
+        {"claim_id": claim_id},
+        {"$set": {
+            "claim_id": claim_id,
+            "active_score": active_score,
+            "active_version": model_ver,
+            "shadow_score": shadow_score,
+            "shadow_version": get_shadow_version(),
+            "scored_at": datetime.utcnow(),
+        }},
+        upsert=True,
+    )
 
 
 def _classify_risk(score: float) -> str:
@@ -73,6 +96,15 @@ async def predict_claim(claim_id: str) -> PredictResponse | None:
     logger.info("Prediction stored (pending decision)", claim_id=claim_id,
                 risk_score=risk_score, risk_level=risk_level)
 
+    # Shadow scoring: score with candidate model if loaded (non-blocking)
+    if is_shadow_loaded():
+        shadow_proba = predict_shadow(df)
+        if shadow_proba is not None:
+            await _log_shadow_prediction(
+                db, claim_id, risk_score, round(float(shadow_proba[0]), 4),
+                get_model_version(),
+            )
+
     return PredictResponse(
         claim_id=claim_id,
         risk_score=risk_score,
@@ -127,6 +159,9 @@ async def predict_batch(claim_ids: list[str] | None = None) -> list[PredictRespo
         explanations = explain(df, top_n=3)
         model_ver = get_model_version()
 
+        # Shadow scoring for the whole chunk
+        shadow_probas = predict_shadow(df) if is_shadow_loaded() else None
+
         # Store and collect results
         for i, claim_doc in enumerate(claims):
             risk_score = round(float(probas[i]), 4)
@@ -150,6 +185,13 @@ async def predict_batch(claim_ids: list[str] | None = None) -> list[PredictRespo
                 {"$set": prediction.model_dump()},
                 upsert=True,
             )
+
+            # Log shadow prediction
+            if shadow_probas is not None:
+                await _log_shadow_prediction(
+                    db, claim_doc["claim_id"], risk_score,
+                    round(float(shadow_probas[i]), 4), model_ver,
+                )
 
             all_results.append(PredictResponse(
                 claim_id=claim_doc["claim_id"],
