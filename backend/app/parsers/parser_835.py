@@ -2,6 +2,7 @@
 
 from app.parsers.edi_common import (
     split_segments, split_elements, split_components, get_element,
+    normalize_edi,
 )
 from app.schemas.remittance import ParsedRemittance, ServiceLinePayment
 
@@ -20,6 +21,7 @@ STATUS_MAP = {
 
 def parse_835(raw: str) -> list[ParsedRemittance]:
     """Parse an 835 Remittance Advice EDI file and return ParsedRemittance list."""
+    raw = normalize_edi(raw)
     segments = split_segments(raw)
     remittances: list[ParsedRemittance] = []
 

@@ -1,6 +1,58 @@
 """Shared EDI parsing utilities for 837 and 835 files."""
 
 
+def detect_delimiters(raw: str) -> tuple[str, str]:
+    """Detect element and component separators from the ISA segment.
+
+    In EDI, the character immediately after 'ISA' is the element separator,
+    and ISA16 (the last data element before the segment terminator) is the
+    component separator (sub-element separator).
+
+    Returns (element_separator, component_separator).
+    Falls back to ('*', ':') if ISA is not found.
+    """
+    # Find ISA position in the raw content
+    isa_pos = raw.find("ISA")
+    if isa_pos == -1:
+        return ("*", ":")
+
+    # Character right after "ISA" is the element separator
+    element_sep = raw[isa_pos + 3]
+
+    # ISA16 is the component separator — it's the last element before ~
+    # ISA has exactly 16 elements. Find the 16th separator to get ISA16.
+    pos = isa_pos + 3  # start after "ISA"
+    sep_count = 0
+    while pos < len(raw) and sep_count < 16:
+        if raw[pos] == element_sep:
+            sep_count += 1
+        pos += 1
+    # pos now points to the first char of ISA16
+    component_sep = raw[pos] if pos < len(raw) else ":"
+
+    return (element_sep, component_sep)
+
+
+def normalize_edi(raw: str) -> str:
+    """Normalize EDI content to use standard delimiters (* and :).
+
+    Detects the actual delimiters from the ISA segment and replaces
+    them with the standard ones so all parsing code works unchanged.
+    """
+    element_sep, component_sep = detect_delimiters(raw)
+
+    if element_sep == "*" and component_sep == ":":
+        return raw  # already standard
+
+    # Replace component separator first (to avoid conflicts if element_sep == ':')
+    if component_sep != ":":
+        raw = raw.replace(component_sep, ":")
+    if element_sep != "*":
+        raw = raw.replace(element_sep, "*")
+
+    return raw
+
+
 def split_segments(raw: str) -> list[str]:
     """Split EDI content on ~ delimiter, stripping whitespace."""
     raw = raw.replace("\r\n", "").replace("\n", "").replace("\r", "")

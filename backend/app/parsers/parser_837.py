@@ -2,7 +2,7 @@
 
 from app.parsers.edi_common import (
     split_segments, split_elements, split_components,
-    get_element,
+    get_element, normalize_edi,
 )
 from app.schemas.claim import ParsedClaim, ServiceLine
 
@@ -13,6 +13,7 @@ def parse_837(raw: str) -> list[ParsedClaim]:
     Handles multiple ST/SE transaction sets within a single interchange,
     scoping HL IDs per transaction set to avoid collisions.
     """
+    raw = normalize_edi(raw)
     segments = split_segments(raw)
     claims: list[ParsedClaim] = []
 

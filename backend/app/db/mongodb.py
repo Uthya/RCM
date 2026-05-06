@@ -28,6 +28,16 @@ async def connect_db() -> None:
     # Knowledge layer indexes
     await _db.fix_history.create_index([("payer_name", 1), ("issue_type", 1)])
     await _db.fix_history.create_index("cpt_code")
+    # Claim lifecycle indexes
+    await _db.claim_lifecycle.create_index("claim_id", unique=True)
+    await _db.claim_lifecycle.create_index("current_status")
+    await _db.claim_lifecycle.create_index("payer_name")
+    await _db.claim_lifecycle.create_index("total_attempts")
+    # Improved fix_history composite index for payer+CPT+issue+fix lookups
+    await _db.fix_history.create_index([
+        ("payer_name", 1), ("cpt_code", 1),
+        ("issue_type", 1), ("fix_applied", 1),
+    ])
     # ML training loop indexes
     await _db.ml_training_data.create_index("claim_id", unique=True)
     await _db.ml_training_data.create_index("label")

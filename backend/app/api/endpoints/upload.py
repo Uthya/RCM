@@ -113,6 +113,28 @@ async def upload_837(file: UploadFile = File(...)):
             }},
         )
 
+    # ── Lifecycle tracking ──
+    try:
+        from app.services.lifecycle_service import create_or_update_lifecycle
+        flagged_lookup = {
+            cv["claim_id"]: cv for cv in response["risk_summary"]["claim_errors"]
+        }
+        pred_lookup_lc = {p.claim_id: p for p in predictions}
+        for c in valid_claims:
+            cv_data = flagged_lookup.get(c.claim_id)
+            issues = cv_data["issues"] if cv_data else []
+            fixes = []
+            for iss in issues:
+                fixes.extend(iss.get("fixes", []))
+            await create_or_update_lifecycle(
+                claim=c,
+                prediction=pred_lookup_lc.get(c.claim_id),
+                validation_issues=issues,
+                fixes_recommended=fixes,
+            )
+    except Exception as e:
+        logger.warning("Lifecycle tracking failed", error=str(e))
+
     response["data_quality"] = data_quality
     return response
 
@@ -135,6 +157,28 @@ async def _predict_and_validate_background(job_id: str, claim_ids: list[str], cl
                     "action_label": cv.get("action_label", ""),
                 }},
             )
+
+        # ── Lifecycle tracking (background path) ──
+        try:
+            from app.services.lifecycle_service import create_or_update_lifecycle
+            flagged_lookup = {
+                cv["claim_id"]: cv for cv in result["risk_summary"]["claim_errors"]
+            }
+            pred_lookup_lc = {p.claim_id: p for p in predictions}
+            for c in claims:
+                cv_data = flagged_lookup.get(c.claim_id)
+                issues = cv_data["issues"] if cv_data else []
+                fixes = []
+                for iss in issues:
+                    fixes.extend(iss.get("fixes", []))
+                await create_or_update_lifecycle(
+                    claim=c,
+                    prediction=pred_lookup_lc.get(c.claim_id),
+                    validation_issues=issues,
+                    fixes_recommended=fixes,
+                )
+        except Exception as e:
+            logger.warning("Lifecycle tracking failed (background)", error=str(e))
 
         _background_jobs[job_id] = {"status": "completed", "results": result}
     except Exception as e:

@@ -137,36 +137,81 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
             except Exception as e:
                 logger.warning("Failed to create training record", claim_id=remit.claim_id, error=str(e))
 
+            # ── Lifecycle outcome update ──
+            lifecycle_doc = None
+            try:
+                from app.services.lifecycle_service import update_lifecycle_outcome
+                lifecycle_doc = await update_lifecycle_outcome(remit.claim_id, remit, claim_doc=claim)
+            except Exception as e:
+                logger.warning("Failed to update lifecycle outcome", claim_id=remit.claim_id, error=str(e))
+
             # ── Knowledge layer: record fix outcomes ──
-            validation_issues = claim.get("validation_issues", [])
-            if validation_issues:
-                try:
-                    from app.services.knowledge_store import record_fix
-                    payer = claim.get("payer_name", "")
-                    slines = claim.get("service_lines", [])
-                    cpt = slines[0].get("cpt_code", "") if slines else ""
-                    for iss in validation_issues:
-                        reason_first = iss.get("reason", "").split("\n")[0].lower()
-                        if "missing modifier" in reason_first:
-                            issue_type = "missing_modifier"
-                        elif "invalid cpt" in reason_first:
-                            issue_type = "invalid_cpt"
-                        elif "prior authorization" in reason_first:
-                            issue_type = "missing_prior_auth"
-                        else:
-                            continue
-                        fixes = iss.get("fixes", [])
-                        fix_text = fixes[0] if fixes else "unknown"
-                        await record_fix(
-                            claim_id=remit.claim_id,
-                            issue_type=issue_type,
-                            fix_applied=fix_text,
-                            payer_name=payer,
-                            cpt_code=cpt,
-                            outcome=remit.claim_status,
-                        )
-                except Exception as e:
-                    logger.warning("Failed to record fix", error=str(e))
+            # Enhanced: for resubmissions, use the actual fix_applied from
+            # lifecycle diff and record against the first attempt's issues.
+            try:
+                from app.services.knowledge_store import record_fix
+                payer = claim.get("payer_name", "")
+                slines = claim.get("service_lines", [])
+                cpt = slines[0].get("cpt_code", "") if slines else ""
+
+                if (
+                    lifecycle_doc
+                    and lifecycle_doc.get("total_attempts", 1) > 1
+                    and remit.claim_status == "paid"
+                ):
+                    # Resubmission that got paid — use lifecycle's fix_applied
+                    # and first attempt's issues for accurate fix tracking
+                    attempts = lifecycle_doc.get("attempts", [])
+                    latest = attempts[-1] if attempts else {}
+                    first = attempts[0] if attempts else {}
+                    fix_applied_text = latest.get("fix_applied", "")
+
+                    if fix_applied_text:
+                        first_issues = first.get("validation_issues", [])
+                        for iss in first_issues:
+                            reason_first = iss.get("reason", "").split("\n")[0].lower()
+                            if "missing modifier" in reason_first:
+                                issue_type = "missing_modifier"
+                            elif "invalid cpt" in reason_first:
+                                issue_type = "invalid_cpt"
+                            elif "prior authorization" in reason_first:
+                                issue_type = "missing_prior_auth"
+                            else:
+                                continue
+                            await record_fix(
+                                claim_id=remit.claim_id,
+                                issue_type=issue_type,
+                                fix_applied=fix_applied_text,
+                                payer_name=payer,
+                                cpt_code=cpt,
+                                outcome=remit.claim_status,
+                            )
+                else:
+                    # First-attempt outcome — existing logic
+                    validation_issues = claim.get("validation_issues", [])
+                    if validation_issues:
+                        for iss in validation_issues:
+                            reason_first = iss.get("reason", "").split("\n")[0].lower()
+                            if "missing modifier" in reason_first:
+                                issue_type = "missing_modifier"
+                            elif "invalid cpt" in reason_first:
+                                issue_type = "invalid_cpt"
+                            elif "prior authorization" in reason_first:
+                                issue_type = "missing_prior_auth"
+                            else:
+                                continue
+                            fixes = iss.get("fixes", [])
+                            fix_text = fixes[0] if fixes else "unknown"
+                            await record_fix(
+                                claim_id=remit.claim_id,
+                                issue_type=issue_type,
+                                fix_applied=fix_text,
+                                payer_name=payer,
+                                cpt_code=cpt,
+                                outcome=remit.claim_status,
+                            )
+            except Exception as e:
+                logger.warning("Failed to record fix", error=str(e))
 
     total_matched = await db.claims.count_documents({"actual_outcome": {"$exists": True}})
     total_training = await db.ml_training_data.count_documents({})
