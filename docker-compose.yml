@@ -1,10 +1,14 @@
 services:
-  mongodb:
-    image: mongo:7
+  postgres:
+    image: postgres:16-alpine
     ports:
-      - "27017:27017"
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=rcm_demo
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
     volumes:
-      - mongo_data:/data/db
+      - pg_data:/var/lib/postgresql/data
 
   redis:
     image: redis:7-alpine
@@ -16,11 +20,10 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - MONGO_URL=mongodb://mongodb:27017
-      - MONGO_DB=rcm_demo
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/rcm_demo
       - REDIS_URL=redis://redis:6379
     depends_on:
-      - mongodb
+      - postgres
       - redis
     volumes:
       - ./backend/app:/app/app
@@ -36,4 +39,4 @@ services:
       - backend
 
 volumes:
-  mongo_data:
+  pg_data:

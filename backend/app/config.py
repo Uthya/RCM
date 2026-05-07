@@ -3,8 +3,7 @@ from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
-    MONGO_URL: str = "mongodb://localhost:27017"
-    MONGO_DB: str = "rcm_demo"
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/rcm_demo"
     MODEL_DIR: str = str(Path(__file__).resolve().parent.parent / "models")
     REDIS_URL: str = "redis://localhost:6379"
     RISK_HIGH_THRESHOLD: float = 0.7

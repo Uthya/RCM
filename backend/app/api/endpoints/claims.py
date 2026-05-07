@@ -1,5 +1,7 @@
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_db
 from app.services.claim_service import get_claims, get_claim
 from app.schemas.claim import ClaimListResponse, ClaimResponse
 
@@ -14,8 +16,10 @@ async def list_claims(
     payer_id: str | None = Query(None),
     sort_by: str = Query("created_at", description="Sort field"),
     sort_order: int = Query(-1, description="-1 for desc, 1 for asc"),
+    session: AsyncSession = Depends(get_db),
 ):
     claims, total = await get_claims(
+        session,
         skip=skip, limit=limit,
         risk_level=risk_level, payer_id=payer_id,
         sort_by=sort_by, sort_order=sort_order,
@@ -24,8 +28,8 @@ async def list_claims(
 
 
 @router.get("/{claim_id}", response_model=ClaimResponse)
-async def get_claim_detail(claim_id: str):
-    claim = await get_claim(claim_id)
+async def get_claim_detail(claim_id: str, session: AsyncSession = Depends(get_db)):
+    claim = await get_claim(session, claim_id)
     if not claim:
         raise HTTPException(status_code=404, detail="Claim not found")
     return claim

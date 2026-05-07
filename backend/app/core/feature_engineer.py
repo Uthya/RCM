@@ -1,17 +1,20 @@
 """Transform parsed claim JSON into numeric feature vectors for XGBoost.
 
 Uses Redis for caching historical denial rates (TTL = 5 min).
-Falls back to direct MongoDB queries if Redis is unavailable.
+Falls back to direct PostgreSQL queries if Redis is unavailable.
 """
 
 from datetime import datetime
 
+import hashlib
 import numpy as np
 import pandas as pd
 import structlog
 
-from app.db.mongodb import get_db
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from app.config import settings
+from app.repositories import remittance_repo
 
 logger = structlog.get_logger()
 
@@ -37,7 +40,6 @@ async def init_cache():
 
 
 async def _get_cached_rate(key: str) -> float | None:
-    """Get a cached rate from Redis."""
     if _redis and _redis_available:
         try:
             val = await _redis.get(key)
@@ -49,13 +51,15 @@ async def _get_cached_rate(key: str) -> float | None:
 
 
 async def _set_cached_rate(key: str, rate: float):
-    """Cache a rate in Redis with TTL."""
     if _redis and _redis_available:
         try:
             await _redis.set(key, str(rate), ex=CACHE_TTL)
         except Exception:
             pass
 
+
+# Bump this whenever FEATURE_NAMES list changes (add, remove, rename, reorder)
+FEATURE_VERSION = "v1"
 
 # Ordered feature names matching the trained model
 FEATURE_NAMES = [
@@ -72,6 +76,9 @@ FEATURE_NAMES = [
     "cpt_denial_rate",
     "provider_denial_rate",
 ]
+
+FEATURE_COUNT = len(FEATURE_NAMES)
+FEATURE_HASH = hashlib.sha256(",".join(sorted(FEATURE_NAMES)).encode()).hexdigest()[:16]
 
 # Feature display names for SHAP explanations
 FEATURE_DISPLAY_NAMES = {
@@ -96,7 +103,6 @@ def compute_features_from_claim(claim_doc: dict) -> dict:
     total_charge = claim_doc.get("total_charge", 0.0)
     line_count = max(len(service_lines), 1)
 
-    # Check if any service line is missing a modifier
     modifier_missing = 0
     cpt_codes = set()
     for sl in service_lines:
@@ -105,14 +111,9 @@ def compute_features_from_claim(claim_doc: dict) -> dict:
             modifier_missing = 1
         cpt_codes.add(sl.get("cpt_code", ""))
 
-    # Patient age
     patient_age = _compute_age(claim_doc.get("patient_dob", ""))
-
-    # Place of service encoding (simple hash)
     pos = claim_doc.get("place_of_service", "11")
     pos_encoded = _encode_pos(pos)
-
-    # Prior auth
     prior_auth = 1 if claim_doc.get("prior_auth_number", "") else 0
 
     return {
@@ -125,16 +126,14 @@ def compute_features_from_claim(claim_doc: dict) -> dict:
         "patient_age": patient_age,
         "place_of_service_encoded": pos_encoded,
         "prior_auth_present": prior_auth,
-        "payer_denial_rate": 0.0,  # filled by async enrichment
+        "payer_denial_rate": 0.0,
         "cpt_denial_rate": 0.0,
         "provider_denial_rate": 0.0,
     }
 
 
-async def enrich_with_historical_rates(features: dict, claim_doc: dict) -> dict:
+async def enrich_with_historical_rates(session: AsyncSession, features: dict, claim_doc: dict) -> dict:
     """Enrich features with historical denial rates. Uses Redis cache first."""
-    db = get_db()
-
     payer_name = claim_doc.get("payer_name", "")
     payer_id = claim_doc.get("payer_id", "")
     if payer_id:
@@ -143,11 +142,10 @@ async def enrich_with_historical_rates(features: dict, claim_doc: dict) -> dict:
         if cached is not None:
             features["payer_denial_rate"] = cached
         else:
-            rate = await _denial_rate(db.remittances, {"payer_name": payer_name})
+            rate = await remittance_repo.get_denial_rate(session, "payer_name", payer_name)
             features["payer_denial_rate"] = rate
             await _set_cached_rate(cache_key, rate)
 
-    # CPT denial rate (primary CPT)
     service_lines = claim_doc.get("service_lines", [])
     if service_lines:
         primary_cpt = service_lines[0].get("cpt_code", "")
@@ -157,24 +155,10 @@ async def enrich_with_historical_rates(features: dict, claim_doc: dict) -> dict:
             if cached is not None:
                 features["cpt_denial_rate"] = cached
             else:
-                pipeline = [
-                    {"$unwind": "$service_lines"},
-                    {"$match": {"service_lines.cpt_code": primary_cpt}},
-                    {"$group": {
-                        "_id": None,
-                        "total": {"$sum": 1},
-                        "denied": {"$sum": {"$cond": [{"$eq": ["$claim_status", "denied"]}, 1, 0]}},
-                    }},
-                ]
-                result = await db.remittances.aggregate(pipeline).to_list(1)
-                if result and result[0]["total"] > 0:
-                    rate = result[0]["denied"] / result[0]["total"]
-                else:
-                    rate = 0.0
+                rate = await remittance_repo.get_cpt_denial_rate(session, primary_cpt)
                 features["cpt_denial_rate"] = rate
                 await _set_cached_rate(cache_key, rate)
 
-    # Provider denial rate
     npi = claim_doc.get("billing_provider_npi", "")
     if npi:
         cache_key = f"denial_rate:provider:{npi}"
@@ -182,20 +166,11 @@ async def enrich_with_historical_rates(features: dict, claim_doc: dict) -> dict:
         if cached is not None:
             features["provider_denial_rate"] = cached
         else:
-            rate = await _denial_rate(db.remittances, {"payee_npi": npi})
+            rate = await remittance_repo.get_denial_rate(session, "payee_npi", npi)
             features["provider_denial_rate"] = rate
             await _set_cached_rate(cache_key, rate)
 
     return features
-
-
-async def _denial_rate(collection, query: dict) -> float:
-    """Compute denial rate for given query on remittances collection."""
-    total = await collection.count_documents(query)
-    if total == 0:
-        return 0.0
-    denied = await collection.count_documents({**query, "claim_status": "denied"})
-    return denied / total
 
 
 def features_to_dataframe(feature_dicts: list[dict]) -> pd.DataFrame:
@@ -204,9 +179,8 @@ def features_to_dataframe(feature_dicts: list[dict]) -> pd.DataFrame:
 
 
 def _compute_age(dob_str: str) -> float:
-    """Compute age from DOB string (YYYYMMDD format)."""
     if not dob_str or len(dob_str) < 8:
-        return 45.0  # default
+        return 45.0
     try:
         dob = datetime.strptime(dob_str[:8], "%Y%m%d")
         today = datetime.utcnow()
@@ -217,14 +191,8 @@ def _compute_age(dob_str: str) -> float:
 
 
 def _encode_pos(pos: str) -> int:
-    """Simple encoding for place of service codes."""
     pos_map = {
-        "11": 1,  # Office
-        "21": 2,  # Inpatient Hospital
-        "22": 3,  # Outpatient Hospital
-        "23": 4,  # Emergency Room
-        "24": 5,  # Ambulatory Surgical Center
-        "31": 6,  # Skilled Nursing Facility
-        "81": 7,  # Independent Laboratory
+        "11": 1, "21": 2, "22": 3, "23": 4,
+        "24": 5, "31": 6, "81": 7,
     }
     return pos_map.get(pos, 0)

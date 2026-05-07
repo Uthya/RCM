@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.db.mongodb import connect_db, close_db, get_db
+from app.db.database import init_db, close_db, get_session_factory
 from app.core.predictor import load_model
 from app.core.feature_engineer import init_cache
 from app.api.router import api_router
@@ -12,9 +12,10 @@ from app.services.decision_engine import load_config as load_decision_config
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await connect_db()
+    await init_db()
     load_model()
-    await load_decision_config(get_db())
+    async with get_session_factory()() as session:
+        await load_decision_config(session)
     await init_cache()
     yield
     await close_db()

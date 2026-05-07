@@ -1,17 +1,18 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.predictor import is_model_loaded
-from app.db.mongodb import get_db
+from app.api.deps import get_db
 
 router = APIRouter()
 
 
 @router.get("/health")
-async def health_check():
+async def health_check(session: AsyncSession = Depends(get_db)):
     db_connected = False
     try:
-        db = get_db()
-        await db.command("ping")
+        await session.execute(text("SELECT 1"))
         db_connected = True
     except Exception:
         pass

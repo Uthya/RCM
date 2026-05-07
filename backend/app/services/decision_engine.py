@@ -4,7 +4,7 @@ Decision Engine — single source of truth for claim action routing.
 Computes a composite score from ML model output + payer weight + CPT risk
 pattern + issue severity, then routes to auto_submit / review / fix_required.
 
-Weights are loaded from MongoDB at startup (falls back to defaults).
+Weights are loaded from PostgreSQL at startup (falls back to defaults).
 """
 
 from __future__ import annotations
@@ -12,6 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.repositories import config_repo
 
 logger = structlog.get_logger()
 
@@ -33,41 +36,29 @@ DEFAULT_CPT_RISK_PATTERNS: list[dict] = [
 ]
 
 # ── Critical issue weights ──
-# These issues are individually significant enough to affect the score
-# regardless of total issue count. They reflect real-world rejection reasons.
 CRITICAL_ISSUE_WEIGHTS: dict[str, float] = {
-    "missing_npi": 0.25,             # auto-rejected by every clearinghouse
-    "missing_modifier": 0.15,        # most common denial reason
-    "missing_prior_auth": 0.10,      # high-charge claims without auth
-    "invalid_cpt": 0.20,             # unbillable — guaranteed rejection
-    "missing_payer_id": 0.15,        # cannot route the claim
-    "weak_diagnosis": 0.10,          # medical necessity / downcoding risk
-    "vague_sole_diagnosis": 0.15,    # non-specific ICD as sole dx — audit flag
-    "missing_dob": 0.05,             # eligibility verification fails
-    "concentration_risk": 0.08,      # same patient high-volume billing pattern
+    "missing_npi": 0.25,
+    "missing_modifier": 0.15,
+    "missing_prior_auth": 0.10,
+    "invalid_cpt": 0.20,
+    "missing_payer_id": 0.15,
+    "weak_diagnosis": 0.10,
+    "vague_sole_diagnosis": 0.15,
+    "missing_dob": 0.05,
+    "concentration_risk": 0.08,
 }
 
 # ── Payer-specific modifier escalation ──
-# Some payers (especially government) deny 100% of claims with missing modifiers.
-# These multipliers are applied to the missing_modifier weight for those payers.
 PAYER_MODIFIER_MULTIPLIER: dict[str, float] = {
-    "MEDICAID": 2.0,     # Medicaid denies/pends ~100% without modifiers
-    "MA": 2.0,           # Medicaid alias
-    "MEDICARE": 1.5,     # Medicare strict on modifier compliance
-    "TRICARE": 1.5,      # Government — strict modifier enforcement
+    "MEDICAID": 2.0,
+    "MA": 2.0,
+    "MEDICARE": 1.5,
+    "TRICARE": 1.5,
 }
 
 # ── Non-specific / vague ICD-10 codes ──
-# These codes as the sole diagnosis raise medical necessity and audit flags.
 VAGUE_DIAGNOSIS_CODES: set[str] = {
-    "R69",    # Illness, unspecified
-    "Z741",   # Need for assistance with personal care (social code)
-    "Z739",   # Problem related to life management, unspecified
-    "Z762",   # Encounter for health supervision of foundling
-    "Z711",   # Person with feared health complaint
-    "R688",   # Other general symptoms and signs
-    "R6889",  # Other general symptoms and signs
-    "Z7689",  # Persons encountering health services in other circumstances
+    "R69", "Z741", "Z739", "Z762", "Z711", "R688", "R6889", "Z7689",
 }
 
 
@@ -86,8 +77,8 @@ class ScoreBreakdown:
 
 @dataclass
 class ClaimDecision:
-    action: str            # "auto_submit" | "review" | "fix_required"
-    action_label: str      # "Auto Submit" | "Review" | "Fix Required"
+    action: str
+    action_label: str
     can_submit: bool
     requires_review: bool
     threshold_note: str
@@ -101,18 +92,18 @@ _cpt_patterns: list[dict] = []
 _config_loaded: bool = False
 
 
-async def load_config(db) -> None:
+async def load_config(session: AsyncSession) -> None:
     """Load decision config from DB. Falls back to defaults if empty."""
     global _payer_weights, _cpt_patterns, _config_loaded
 
     try:
-        pw = await db.decision_config.find_one({"type": "payer_weights"})
-        _payer_weights = pw["weights"] if pw else dict(DEFAULT_PAYER_WEIGHTS)
+        pw = await config_repo.get_payer_weights(session)
+        _payer_weights = pw if pw else dict(DEFAULT_PAYER_WEIGHTS)
     except Exception:
         _payer_weights = dict(DEFAULT_PAYER_WEIGHTS)
 
     try:
-        cpt_docs = await db.cpt_risk_config.find().to_list(100)
+        cpt_docs = await config_repo.get_cpt_patterns(session)
         _cpt_patterns = cpt_docs if cpt_docs else list(DEFAULT_CPT_RISK_PATTERNS)
     except Exception:
         _cpt_patterns = list(DEFAULT_CPT_RISK_PATTERNS)
@@ -126,7 +117,6 @@ async def load_config(db) -> None:
 
 
 def _ensure_defaults() -> None:
-    """Ensure in-memory config has at least defaults if load_config wasn't called."""
     global _payer_weights, _cpt_patterns, _config_loaded
     if not _config_loaded:
         _payer_weights = dict(DEFAULT_PAYER_WEIGHTS)
@@ -135,12 +125,7 @@ def _ensure_defaults() -> None:
 
 
 def classify_issues(issues: list[dict], payer_name: str = "") -> list[dict]:
-    """Classify validation issues into weighted categories.
-
-    Each issue dict should have a 'reason' key with the first line
-    identifying the issue type. Payer name is used for payer-specific
-    weight escalation (e.g., Medicaid modifier strictness).
-    """
+    """Classify validation issues into weighted categories."""
     payer_key = payer_name.upper().split()[0] if payer_name else ""
     modifier_multiplier = PAYER_MODIFIER_MULTIPLIER.get(payer_key, 1.0)
 
@@ -182,22 +167,12 @@ def decide(
     primary_cpt: str = "",
     issues: list[dict] | None = None,
 ) -> ClaimDecision:
-    """
-    Compute composite score and return action decision.
-
-    Composite = base ML score + payer weight + CPT risk weight + issue severity.
-    Capped at 1.0.
-
-    If `issues` (list of issue dicts with 'reason' key) is provided, uses
-    per-issue severity weights. Otherwise falls back to count-based escalation.
-    """
+    """Compute composite score and return action decision."""
     _ensure_defaults()
 
-    # 1. Payer weight
     payer_key = payer_name.upper().split()[0] if payer_name else ""
     payer_w = _payer_weights.get(payer_key, 0.0)
 
-    # 2. CPT risk weight — longest prefix match first
     cpt_w = 0.0
     cpt_label = ""
     for pat in sorted(_cpt_patterns, key=lambda p: len(p.get("cpt_prefix", "")), reverse=True):
@@ -207,14 +182,11 @@ def decide(
             cpt_label = pat.get("label", "")
             break
 
-    # 3. Issue severity — per-issue weights if available, else count-based
     issue_details: list[dict] = []
     if issues is not None and len(issues) > 0:
         issue_details = classify_issues(issues, payer_name=payer_name)
-        # Sum individual weights — each critical issue contributes its own weight
         issue_w = sum(d["weight"] for d in issue_details)
     else:
-        # Fallback to count-based escalation
         if issue_count >= 5:
             issue_w = 0.15
         elif issue_count >= 3:
@@ -224,7 +196,6 @@ def decide(
         else:
             issue_w = 0.0
 
-    # 4. Composite (capped at 1.0)
     final = min(risk_score + payer_w + cpt_w + issue_w, 1.0)
 
     breakdown = ScoreBreakdown(
@@ -238,7 +209,6 @@ def decide(
         issue_details=issue_details,
     )
 
-    # 5. Route action
     has_critical = any(
         d["type"] in ("missing_npi", "invalid_cpt", "missing_payer_id")
         or (d["type"] == "missing_modifier" and d.get("payer_escalated"))
@@ -275,7 +245,7 @@ def decide(
 
 
 def decision_to_dict(d: ClaimDecision) -> dict:
-    """Serialize a ClaimDecision to a plain dict for API responses / MongoDB."""
+    """Serialize a ClaimDecision to a plain dict for API responses."""
     return {
         "action": d.action,
         "action_label": d.action_label,

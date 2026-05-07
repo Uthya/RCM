@@ -1,27 +1,26 @@
 """Model management endpoints — retrain, status, training history, versioning."""
 
 from datetime import datetime
-from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
 import structlog
 
-from app.db.mongodb import get_db
+from app.api.deps import get_db
 from app.services.model_trainer import (
     retrain_model, get_training_status, promote_model, rollback_model,
     DEFAULT_TRAINING_WINDOW_DAYS,
 )
 from app.services.remittance_service import CARC_DESCRIPTIONS
+from app.repositories import training_repo, model_repo, outcome_repo, prediction_repo
 
 logger = structlog.get_logger()
 router = APIRouter(prefix="/model", tags=["model"])
 
 
 @router.get("/training-status")
-async def training_status():
-    """Get current training data availability and last training info."""
-    db = get_db()
-    return await get_training_status(db)
+async def training_status(session: AsyncSession = Depends(get_db)):
+    return await get_training_status(session)
 
 
 @router.post("/retrain")
@@ -29,54 +28,34 @@ async def retrain(
     training_window_days: int = Query(
         default=DEFAULT_TRAINING_WINDOW_DAYS,
         ge=7,
-        description="Only use training records from the last N days. "
-                    "Falls back to all data if the windowed set is too small.",
+        description="Only use training records from the last N days.",
     ),
+    session: AsyncSession = Depends(get_db),
 ):
-    """Retrain the model using pre-joined training data from ml_training_data."""
-    db = get_db()
-    result = await retrain_model(db, training_window_days=training_window_days)
+    result = await retrain_model(session, training_window_days=training_window_days)
     return result
 
 
 @router.get("/training-data")
-async def training_data_stats():
-    """Stats on ml_training_data: total, class distribution, top denial codes, gap analysis."""
-    db = get_db()
-
-    total = await db.ml_training_data.count_documents({})
-    denied = await db.ml_training_data.count_documents({"label": 1})
+async def training_data_stats(session: AsyncSession = Depends(get_db)):
+    total = await training_repo.count_records(session)
+    denied = await training_repo.count_records(session, label=1)
     paid = total - denied
 
-    # Top denial codes
-    pipeline = [
-        {"$match": {"label": 1, "denial_code": {"$ne": None}}},
-        {"$group": {"_id": "$denial_code", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-        {"$limit": 10},
-    ]
-    top_codes_raw = await db.ml_training_data.aggregate(pipeline).to_list(10)
+    top_codes_raw = await training_repo.get_top_denial_codes(session)
     top_denial_codes = [
         {
-            "code": doc["_id"],
-            "description": CARC_DESCRIPTIONS.get(doc["_id"], "Unknown"),
+            "code": doc["code"],
+            "description": CARC_DESCRIPTIONS.get(doc["code"], "Unknown"),
             "count": doc["count"],
         }
         for doc in top_codes_raw
     ]
 
-    # Gap analysis: matched claims with predictions but no training record
-    matched_claims = await db.claims.count_documents(
-        {"actual_outcome": {"$in": ["paid", "denied"]}}
-    )
+    matched_claims = await outcome_repo.count_outcomes(session, status_filter=["paid", "denied"])
     gap = matched_claims - total
 
-    # Model version distribution in training data
-    version_pipeline = [
-        {"$group": {"_id": "$model_version_at_prediction", "count": {"$sum": 1}}},
-        {"$sort": {"count": -1}},
-    ]
-    version_dist = await db.ml_training_data.aggregate(version_pipeline).to_list(20)
+    version_dist = await training_repo.get_version_distribution(session)
 
     return {
         "total": total,
@@ -92,20 +71,15 @@ async def training_data_stats():
                        else "All matched claims have training records",
         },
         "model_version_distribution": [
-            {"version": doc["_id"], "count": doc["count"]}
+            {"version": doc["version"], "count": doc["count"]}
             for doc in version_dist
         ],
     }
 
 
 @router.get("/versions")
-async def model_versions():
-    """List all model versions from model_registry with metrics."""
-    db = get_db()
-
-    cursor = db.model_registry.find().sort("version", -1)
-    versions = await cursor.to_list(100)
-
+async def model_versions(session: AsyncSession = Depends(get_db)):
+    versions = await model_repo.list_versions(session)
     return {
         "versions": [
             {
@@ -127,71 +101,64 @@ async def model_versions():
 
 
 @router.post("/backfill-training-data")
-async def backfill_training_data():
-    """One-time migration: create ml_training_data records for previously matched claims.
+async def backfill_training_data(session: AsyncSession = Depends(get_db)):
+    """One-time migration: create ml_training_data records for previously matched claims."""
+    existing_ids = await training_repo.get_all_claim_ids(session)
 
-    Finds claims with actual_outcome that have predictions with features
-    but no ml_training_data record yet.
-    """
-    db = get_db()
-
-    # Get all claim_ids already in ml_training_data
-    existing_ids = set()
-    cursor = db.ml_training_data.find({}, {"claim_id": 1})
-    async for doc in cursor:
-        existing_ids.add(doc["claim_id"])
-
-    # Find matched claims not yet in training data
-    claims_cursor = db.claims.find(
-        {"actual_outcome": {"$in": ["paid", "denied"]}},
-        {"claim_id": 1, "actual_outcome": 1, "paid_amount": 1,
-         "carc_codes": 1, "carc_descriptions": 1},
+    from sqlalchemy import select
+    from app.db.models import ClaimOutcome
+    result = await session.execute(
+        select(ClaimOutcome).where(ClaimOutcome.outcome_status.in_(["paid", "denied"]))
     )
-    claims = await claims_cursor.to_list(100_000)
+    outcomes = result.scalars().all()
 
     created = 0
     skipped_no_prediction = 0
     skipped_existing = 0
 
-    for claim in claims:
-        claim_id = claim["claim_id"]
+    from app.core.feature_engineer import FEATURE_VERSION, FEATURE_COUNT, FEATURE_HASH
+
+    for outcome_obj in outcomes:
+        claim_id = outcome_obj.claim_id
         if claim_id in existing_ids:
             skipped_existing += 1
             continue
 
-        # Look up prediction with features
-        prediction = await db.predictions.find_one({"claim_id": claim_id})
+        prediction = await prediction_repo.find_prediction(session, claim_id)
         if not prediction or not prediction.get("features"):
             skipped_no_prediction += 1
             continue
 
-        label = 1 if claim.get("actual_outcome") == "denied" else 0
-        carc_codes = claim.get("carc_codes", [])
+        actual_outcome = outcome_obj.outcome_status or ""
+        label = 1 if actual_outcome == "denied" else 0
+        carc_codes = outcome_obj.carc_codes or []
         first_carc = carc_codes[0] if carc_codes else None
 
         training_doc = {
             "claim_id": claim_id,
+            "attempt_number": 1,
+            "is_first_attempt": True,
             "features": prediction["features"],
             "label": label,
-            "actual_outcome": claim.get("actual_outcome"),
+            "actual_outcome": actual_outcome,
             "denial_code": first_carc,
             "denial_code_description": CARC_DESCRIPTIONS.get(first_carc, "Unknown") if first_carc else None,
             "all_carc_codes": carc_codes,
-            "paid_amount": claim.get("paid_amount", 0.0),
+            "paid_amount": outcome_obj.paid_amount or 0.0,
             "billed_amount": prediction["features"].get("total_charge", 0.0),
             "model_version_at_prediction": prediction.get("model_version", "unknown"),
             "prediction_risk_score": prediction.get("risk_score"),
+            "feature_version": prediction.get("feature_version", FEATURE_VERSION),
+            "feature_count": FEATURE_COUNT,
+            "feature_hash": FEATURE_HASH,
             "created_at": datetime.utcnow(),
         }
 
-        await db.ml_training_data.update_one(
-            {"claim_id": claim_id},
-            {"$set": training_doc},
-            upsert=True,
-        )
+        await training_repo.upsert_training_record(session, training_doc)
         created += 1
 
-    total_training = await db.ml_training_data.count_documents({})
+    await session.commit()
+    total_training = await training_repo.count_records(session)
 
     return {
         "status": "success",
@@ -205,35 +172,26 @@ async def backfill_training_data():
 @router.post("/promote/{version}")
 async def promote(
     version: int,
-    force: bool = Query(
-        default=False,
-        description="Force promotion even if AUC drops below threshold",
-    ),
+    force: bool = Query(default=False, description="Force promotion even if AUC drops below threshold"),
+    session: AsyncSession = Depends(get_db),
 ):
-    """Promote a candidate model to active. Warns if metrics regress."""
-    db = get_db()
-    result = await promote_model(db, version, force=force)
+    result = await promote_model(session, version, force=force)
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
     return result
 
 
 @router.post("/rollback")
-async def rollback():
-    """Rollback to the previous active model version."""
-    db = get_db()
-    result = await rollback_model(db)
+async def rollback(session: AsyncSession = Depends(get_db)):
+    result = await rollback_model(session)
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
     return result
 
 
 @router.get("/shadow-comparison")
-async def shadow_comparison():
-    """Compare active model vs shadow model on recent predictions."""
+async def shadow_comparison(session: AsyncSession = Depends(get_db)):
     from app.core.predictor import is_shadow_loaded, get_shadow_version, get_model_version
-
-    db = get_db()
 
     if not is_shadow_loaded():
         return {
@@ -241,10 +199,7 @@ async def shadow_comparison():
             "message": "No shadow model loaded. Retrain to create a candidate.",
         }
 
-    # Aggregate shadow prediction stats
-    shadow_docs = await db.shadow_predictions.find(
-        {}, {"shadow_score": 1, "active_score": 1, "claim_id": 1}
-    ).to_list(100_000)
+    shadow_docs = await prediction_repo.get_shadows(session)
 
     if not shadow_docs:
         return {
@@ -261,23 +216,18 @@ async def shadow_comparison():
     active_arr = np.array(active_scores)
     shadow_arr = np.array(shadow_scores)
 
-    # Compare predictions that crossed the 0.5 threshold differently
     active_high = (active_arr >= 0.5).sum()
     shadow_high = (shadow_arr >= 0.5).sum()
     score_diff = float(np.mean(shadow_arr - active_arr))
     correlation = float(np.corrcoef(active_arr, shadow_arr)[0, 1]) if len(active_arr) > 1 else None
 
-    # If we have outcomes, compute AUC for both
-    docs_with_outcome = await db.shadow_predictions.find(
-        {"actual_outcome": {"$exists": True}},
-        {"shadow_score": 1, "active_score": 1, "actual_outcome": 1},
-    ).to_list(100_000)
+    docs_with_outcome = await prediction_repo.get_shadows_with_outcomes(session)
 
     auc_comparison = None
     if len(docs_with_outcome) > 10:
         from sklearn.metrics import roc_auc_score
         labels = [1 if d["actual_outcome"] == "denied" else 0 for d in docs_with_outcome]
-        if len(set(labels)) > 1:  # need both classes
+        if len(set(labels)) > 1:
             active_auc = float(roc_auc_score(labels, [d["active_score"] for d in docs_with_outcome]))
             shadow_auc = float(roc_auc_score(labels, [d["shadow_score"] for d in docs_with_outcome]))
             auc_comparison = {
@@ -287,11 +237,10 @@ async def shadow_comparison():
                 "samples_with_outcome": len(docs_with_outcome),
             }
 
-    # Get registry metrics for both models
-    active_model = await db.model_registry.find_one({"is_active": True})
+    active_model = await model_repo.get_active(session)
     shadow_version = get_shadow_version()
     shadow_version_num = int(shadow_version.lstrip("v")) if shadow_version.startswith("v") else None
-    shadow_model_reg = await db.model_registry.find_one({"version": shadow_version_num}) if shadow_version_num else None
+    shadow_model_reg = await model_repo.find_by_version(session, shadow_version_num) if shadow_version_num else None
 
     return {
         "status": "ok",

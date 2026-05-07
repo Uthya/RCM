@@ -1,10 +1,13 @@
-"""CRUD operations for parsed 835 remittance data in MongoDB."""
+"""CRUD operations for parsed 835 remittance data."""
 
 from datetime import datetime
 
 import structlog
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.mongodb import get_db
+from app.repositories import (
+    remittance_repo, claim_repo, outcome_repo, prediction_repo, training_repo,
+)
 from app.schemas.remittance import ParsedRemittance, RemittanceResponse
 
 logger = structlog.get_logger()
@@ -40,7 +43,6 @@ CARC_DESCRIPTIONS: dict[str, str] = {
 
 
 def _enrich_carc_descriptions(carc_codes: list[str]) -> list[dict]:
-    """Return list of {code, description} for known CARC codes."""
     return [
         {"code": code, "description": CARC_DESCRIPTIONS.get(code, "Unknown adjustment reason")}
         for code in carc_codes
@@ -48,17 +50,22 @@ def _enrich_carc_descriptions(carc_codes: list[str]) -> list[dict]:
 
 
 async def _create_training_record(
-    db,
+    session: AsyncSession,
     claim_id: str,
     remit,
     claim: dict,
 ) -> bool:
     """Join prediction features with 835 outcome into ml_training_data.
 
-    Returns True if a record was created/updated, False otherwise.
+    CRITICAL: Only creates a record for the FIRST 835 outcome per claim.
+    Returns True if a record was created, False otherwise.
     """
-    # Look up stored prediction with features
-    prediction = await db.predictions.find_one({"claim_id": claim_id})
+    existing = await training_repo.find_existing(session, claim_id)
+    if existing:
+        logger.debug("Training record already exists, skipping (first-attempt only)", claim_id=claim_id)
+        return False
+
+    prediction = await prediction_repo.find_prediction(session, claim_id)
     if not prediction or not prediction.get("features"):
         logger.debug("No prediction features for training join", claim_id=claim_id)
         return False
@@ -66,8 +73,12 @@ async def _create_training_record(
     label = 1 if remit.claim_status == "denied" else 0
     first_carc = remit.carc_codes[0] if remit.carc_codes else None
 
+    from app.core.feature_engineer import FEATURE_VERSION, FEATURE_COUNT, FEATURE_HASH
+
     training_doc = {
         "claim_id": claim_id,
+        "attempt_number": 1,
+        "is_first_attempt": True,
         "features": prediction["features"],
         "label": label,
         "actual_outcome": remit.claim_status,
@@ -78,21 +89,19 @@ async def _create_training_record(
         "billed_amount": remit.billed_amount,
         "model_version_at_prediction": prediction.get("model_version", "unknown"),
         "prediction_risk_score": prediction.get("risk_score"),
+        "feature_version": prediction.get("feature_version", FEATURE_VERSION),
+        "feature_count": FEATURE_COUNT,
+        "feature_hash": FEATURE_HASH,
         "created_at": datetime.utcnow(),
     }
 
-    await db.ml_training_data.update_one(
-        {"claim_id": claim_id},
-        {"$set": training_doc},
-        upsert=True,
-    )
-    logger.info("Training record created", claim_id=claim_id, label=label)
+    await training_repo.insert_record(session, training_doc)
+    logger.info("Training record created (first attempt)", claim_id=claim_id, label=label)
     return True
 
 
-async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
+async def store_remittances(session: AsyncSession, remittances: list[ParsedRemittance]) -> dict:
     """Insert parsed 835 remittance records. Returns summary."""
-    db = get_db()
     inserted = 0
     matched = 0
     denied = 0
@@ -103,64 +112,60 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
         doc = remit.model_dump()
         doc["created_at"] = datetime.utcnow()
 
-        await db.remittances.insert_one(doc)
+        await remittance_repo.insert_remittance(session, doc)
         inserted += 1
 
         if remit.claim_status in ("denied",):
             denied += 1
 
-        # Try to match to existing claim and update outcome
-        claim = await db.claims.find_one({"claim_id": remit.claim_id})
+        claim = await claim_repo.find_claim(session, remit.claim_id)
         if claim:
-            # Check if this is a new outcome (wasn't matched before)
-            if not claim.get("actual_outcome"):
+            existing_outcome = await outcome_repo.find_outcome(session, remit.claim_id)
+            if not existing_outcome:
                 new_outcomes += 1
 
             carc_descs = _enrich_carc_descriptions(remit.carc_codes)
-            await db.claims.update_one(
-                {"claim_id": remit.claim_id},
-                {"$set": {
-                    "actual_outcome": remit.claim_status,
-                    "paid_amount": remit.paid_amount,
-                    "carc_codes": remit.carc_codes,
-                    "carc_descriptions": carc_descs,
-                }},
-            )
+            is_new = await outcome_repo.upsert_outcome(session, {
+                "claim_id": remit.claim_id,
+                "attempt_number": 1,
+                "outcome_status": remit.claim_status,
+                "paid_amount": remit.paid_amount,
+                "carc_codes": remit.carc_codes,
+                "carc_descriptions": carc_descs,
+                "created_at": datetime.utcnow(),
+            })
             matched += 1
             logger.info("Matched 835 to claim", claim_id=remit.claim_id, status=remit.claim_status)
 
-            # ── Training data join: prediction features + 835 outcome ──
+            # Training data join
             try:
-                created = await _create_training_record(db, remit.claim_id, remit, claim)
+                created = await _create_training_record(session, remit.claim_id, remit, claim)
                 if created:
                     training_records_created += 1
             except Exception as e:
                 logger.warning("Failed to create training record", claim_id=remit.claim_id, error=str(e))
 
-            # ── Lifecycle outcome update ──
+            # Lifecycle outcome update
             lifecycle_doc = None
             try:
                 from app.services.lifecycle_service import update_lifecycle_outcome
-                lifecycle_doc = await update_lifecycle_outcome(remit.claim_id, remit, claim_doc=claim)
+                lifecycle_doc = await update_lifecycle_outcome(session, remit.claim_id, remit, claim_doc=claim)
             except Exception as e:
                 logger.warning("Failed to update lifecycle outcome", claim_id=remit.claim_id, error=str(e))
 
-            # ── Knowledge layer: record fix outcomes ──
-            # Enhanced: for resubmissions, use the actual fix_applied from
-            # lifecycle diff and record against the first attempt's issues.
+            # Knowledge layer: record fix outcomes
             try:
                 from app.services.knowledge_store import record_fix
                 payer = claim.get("payer_name", "")
                 slines = claim.get("service_lines", [])
                 cpt = slines[0].get("cpt_code", "") if slines else ""
 
-                if (
+                is_resubmission = (
                     lifecycle_doc
                     and lifecycle_doc.get("total_attempts", 1) > 1
-                    and remit.claim_status == "paid"
-                ):
-                    # Resubmission that got paid — use lifecycle's fix_applied
-                    # and first attempt's issues for accurate fix tracking
+                )
+
+                if is_resubmission:
                     attempts = lifecycle_doc.get("attempts", [])
                     latest = attempts[-1] if attempts else {}
                     first = attempts[0] if attempts else {}
@@ -179,6 +184,7 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
                             else:
                                 continue
                             await record_fix(
+                                session,
                                 claim_id=remit.claim_id,
                                 issue_type=issue_type,
                                 fix_applied=fix_applied_text,
@@ -186,8 +192,7 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
                                 cpt_code=cpt,
                                 outcome=remit.claim_status,
                             )
-                else:
-                    # First-attempt outcome — existing logic
+                elif remit.claim_status == "paid":
                     validation_issues = claim.get("validation_issues", [])
                     if validation_issues:
                         for iss in validation_issues:
@@ -203,6 +208,7 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
                             fixes = iss.get("fixes", [])
                             fix_text = fixes[0] if fixes else "unknown"
                             await record_fix(
+                                session,
                                 claim_id=remit.claim_id,
                                 issue_type=issue_type,
                                 fix_applied=fix_text,
@@ -213,8 +219,8 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
             except Exception as e:
                 logger.warning("Failed to record fix", error=str(e))
 
-    total_matched = await db.claims.count_documents({"actual_outcome": {"$exists": True}})
-    total_training = await db.ml_training_data.count_documents({})
+    total_matched = await outcome_repo.count_outcomes(session)
+    total_training = await training_repo.count_records(session)
 
     return {
         "inserted": inserted,
@@ -229,19 +235,16 @@ async def store_remittances(remittances: list[ParsedRemittance]) -> dict:
 
 
 async def get_remittances(
+    session: AsyncSession,
     skip: int = 0,
     limit: int = 50,
 ) -> tuple[list[RemittanceResponse], int]:
-    """Get paginated remittance list."""
-    db = get_db()
-
-    total = await db.remittances.count_documents({})
-    docs = await db.remittances.find().sort("created_at", -1).skip(skip).limit(limit).to_list(limit)
+    rows, total = await remittance_repo.get_remittances_paginated(session, skip=skip, limit=limit)
 
     remittances = []
-    for doc in docs:
+    for doc in rows:
         remittances.append(RemittanceResponse(
-            id=str(doc["_id"]),
+            id=str(doc["id"]),
             claim_id=doc.get("claim_id", ""),
             payer_control_number=doc.get("payer_control_number", ""),
             claim_status=doc.get("claim_status", ""),
@@ -262,23 +265,19 @@ async def get_remittances(
     return remittances, total
 
 
-async def get_remittance(remittance_id: str) -> RemittanceResponse | None:
-    """Get single remittance by MongoDB _id."""
-    from bson import ObjectId
-    from bson.errors import InvalidId
-    db = get_db()
-
+async def get_remittance(session: AsyncSession, remittance_id: str) -> RemittanceResponse | None:
+    """Get single remittance by integer PK."""
     try:
-        oid = ObjectId(remittance_id)
-    except (InvalidId, TypeError):
+        rid = int(remittance_id)
+    except (ValueError, TypeError):
         return None
 
-    doc = await db.remittances.find_one({"_id": oid})
+    doc = await remittance_repo.get_remittance_by_id(session, rid)
     if not doc:
         return None
 
     return RemittanceResponse(
-        id=str(doc["_id"]),
+        id=str(doc["id"]),
         claim_id=doc.get("claim_id", ""),
         payer_control_number=doc.get("payer_control_number", ""),
         claim_status=doc.get("claim_status", ""),
