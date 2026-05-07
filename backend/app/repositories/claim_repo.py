@@ -121,6 +121,8 @@ def _claim_to_dict(c: Claim) -> dict:
         "claim_id": c.claim_id,
         "sender_id": c.sender_id,
         "receiver_id": c.receiver_id,
+        "interchange_control_number": c.interchange_control_number,
+        "transaction_reference": c.transaction_reference,
         "transaction_date": c.transaction_date,
         "billing_provider_name": c.billing_provider_name,
         "billing_provider_npi": c.billing_provider_npi,

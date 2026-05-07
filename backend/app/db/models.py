@@ -111,6 +111,8 @@ class Claim(Base):
     claim_id: Mapped[str] = mapped_column(String(64), unique=True, nullable=False, index=True)
     sender_id: Mapped[str | None] = mapped_column(String(64))
     receiver_id: Mapped[str | None] = mapped_column(String(64))
+    interchange_control_number: Mapped[str | None] = mapped_column(String(64))
+    transaction_reference: Mapped[str | None] = mapped_column(String(64))
     transaction_date: Mapped[str | None] = mapped_column(String(32))
     billing_provider_name: Mapped[str | None] = mapped_column(String(256))
     billing_provider_npi: Mapped[str | None] = mapped_column(String(20))
