@@ -48,6 +48,7 @@ async def retrain_model(session: AsyncSession, training_window_days: int = DEFAU
     cutoff = datetime.utcnow() - timedelta(days=training_window_days)
     real_docs = await training_repo.get_training_data(
         session, created_after=cutoff, feature_version=FEATURE_VERSION,
+        first_attempt_only=True,
     )
     real_count = len(real_docs)
     used_window = True
@@ -56,14 +57,18 @@ async def retrain_model(session: AsyncSession, training_window_days: int = DEFAU
     if real_count < MIN_REAL_SAMPLES:
         logger.warning("Retrain: version-filtered windowed data insufficient",
                        windowed_count=real_count, feature_version=FEATURE_VERSION)
-        real_docs = await training_repo.get_training_data(session, created_after=cutoff)
+        real_docs = await training_repo.get_training_data(
+            session, created_after=cutoff, first_attempt_only=True,
+        )
         real_count = len(real_docs)
 
     # Fallback: all records
     if real_count < MIN_REAL_SAMPLES:
         logger.warning("Retrain: windowed data insufficient, falling back to all records",
                        windowed_count=real_count)
-        real_docs = await training_repo.get_training_data(session)
+        real_docs = await training_repo.get_training_data(
+            session, first_attempt_only=True,
+        )
         real_count = len(real_docs)
         used_window = False
 
@@ -121,16 +126,48 @@ async def retrain_model(session: AsyncSession, training_window_days: int = DEFAU
     if real_count < SYNTHETIC_FILL_TARGET:
         synthetic_count = SYNTHETIC_FILL_TARGET - real_count
         df_synth, y_synth = _generate_synthetic(synthetic_count, seed=int(time.time()) % 10000)
-        df_train = pd.concat([df_real, df_synth], ignore_index=True)
-        y_train_full = np.concatenate([y_real, y_synth])
     else:
-        df_train = df_real
-        y_train_full = y_real
+        df_synth, y_synth = None, None
 
-    # 4. Train/test split
-    X_train, X_test, y_tr, y_te = train_test_split(
-        df_train, y_train_full, test_size=0.2, random_state=42, stratify=y_train_full,
-    )
+    # 4. Train/test split — temporal for real data when possible
+    temporal_split = False
+    if real_count >= 50:
+        # Temporal split: oldest 80% train, newest 20% test (data is ordered by created_at)
+        split_idx = int(real_count * 0.8)
+        df_real_train = df_real.iloc[:split_idx]
+        y_real_train = y_real[:split_idx]
+        df_real_test = df_real.iloc[split_idx:]
+        y_real_test = y_real[split_idx:]
+
+        # Synthetic only augments training set
+        if df_synth is not None:
+            X_train = pd.concat([df_real_train, df_synth], ignore_index=True)
+            y_tr = np.concatenate([y_real_train, y_synth])
+        else:
+            X_train = df_real_train
+            y_tr = y_real_train
+
+        # Test set is ONLY real data (newest 20%)
+        X_test = df_real_test
+        y_te = y_real_test
+        temporal_split = True
+        real_test_flags = np.ones(len(y_te), dtype=bool)  # all test data is real
+    else:
+        # Fallback: random split with real+synthetic
+        if df_synth is not None:
+            df_combined = pd.concat([df_real, df_synth], ignore_index=True)
+            y_combined = np.concatenate([y_real, y_synth])
+        else:
+            df_combined = df_real
+            y_combined = y_real
+
+        # Track real vs synthetic through the split
+        is_real = np.array([True] * real_count + [False] * synthetic_count)
+
+        X_train, X_test, y_tr, y_te, real_train_flags, real_test_flags = train_test_split(
+            df_combined, y_combined, is_real,
+            test_size=0.2, random_state=42, stratify=y_combined,
+        )
 
     # 5. Train XGBoost
     pos_weight = max((y_tr == 0).sum() / max((y_tr == 1).sum(), 1), 1.0)
@@ -150,12 +187,16 @@ async def retrain_model(session: AsyncSession, training_window_days: int = DEFAU
     precision = float(precision_score(y_te, y_pred, zero_division=0))
     recall = float(recall_score(y_te, y_pred, zero_division=0))
 
-    real_test_mask = np.arange(len(y_train_full)) < real_count
-    real_in_test = real_test_mask[len(X_train):]
-    if real_in_test.sum() > 10:
-        auc_real = float(roc_auc_score(y_te[real_in_test], y_pred_proba[real_in_test]))
+    # Real-only metrics (correctly tracked through split)
+    real_test_count = int(real_test_flags.sum())
+    if real_test_count > 10:
+        auc_real = float(roc_auc_score(y_te[real_test_flags], y_pred_proba[real_test_flags]))
+        precision_real = float(precision_score(y_te[real_test_flags], y_pred[real_test_flags], zero_division=0))
+        recall_real = float(recall_score(y_te[real_test_flags], y_pred[real_test_flags], zero_division=0))
     else:
         auc_real = None
+        precision_real = None
+        recall_real = None
 
     # 7. Save versioned model
     model_dir = Path(settings.MODEL_DIR)
@@ -175,6 +216,10 @@ async def retrain_model(session: AsyncSession, training_window_days: int = DEFAU
         "precision": round(precision, 4),
         "recall": round(recall, 4),
         "auc_real_only": round(auc_real, 4) if auc_real else None,
+        "precision_real_only": round(precision_real, 4) if precision_real else None,
+        "recall_real_only": round(recall_real, 4) if recall_real else None,
+        "temporal_split": temporal_split,
+        "real_test_count": real_test_count,
     }
     feature_importance = {
         name: round(float(imp), 4)
@@ -186,7 +231,7 @@ async def retrain_model(session: AsyncSession, training_window_days: int = DEFAU
         "model_version": version_str,
         "real_samples": real_count,
         "synthetic_samples": synthetic_count,
-        "total_samples": len(df_train),
+        "total_samples": len(X_train),
         "denied_count": denied_count,
         "paid_count": paid_count,
         "denial_rate": round(denied_count / real_count, 4),
@@ -431,6 +476,7 @@ async def rollback_model(session: AsyncSession) -> dict:
 def _generate_synthetic(n: int, seed: int = 42) -> tuple[pd.DataFrame, np.ndarray]:
     rng = np.random.RandomState(seed)
     data = {
+        # Existing 14 features
         "total_charge": rng.lognormal(mean=6.5, sigma=1.0, size=n).clip(50, 50000),
         "service_line_count": rng.choice([1, 1, 1, 2, 2, 3, 4, 5], size=n),
         "has_multiple_cpt": rng.choice([0, 0, 0, 1, 1], size=n),
@@ -442,19 +488,43 @@ def _generate_synthetic(n: int, seed: int = 42) -> tuple[pd.DataFrame, np.ndarra
         "payer_denial_rate": rng.beta(2, 8, size=n),
         "cpt_denial_rate": rng.beta(2, 10, size=n),
         "provider_denial_rate": rng.beta(2, 12, size=n),
+        "invalid_npi": rng.choice([0, 0, 0, 0, 0, 1], size=n),
+        "duplicate_risk": rng.choice([0.0, 0.0, 0.0, 0.0, 0.33], size=n),
+        # Aggregate confidence
+        "payer_denial_rate_n": rng.choice([0, 0, 5, 10, 20, 50, 100, 200], size=n),
+        "cpt_denial_rate_n": rng.choice([0, 0, 5, 10, 20, 50, 100], size=n),
+        "provider_denial_rate_n": rng.choice([0, 0, 5, 10, 20, 50], size=n),
+        # New claim-level features
+        "modifier_count": rng.choice([0, 0, 1, 1, 1, 2, 2, 3], size=n),
+        "dx_specificity": rng.normal(4.5, 1.0, size=n).clip(3, 7),
+        "cpt_category": rng.choice([0, 1, 1, 1, 2, 2, 3, 4, 5], size=n),
+        "patient_gender_encoded": rng.choice([0, 1, 1, 2, 2], size=n),
+        "has_rendering_provider": rng.choice([0, 0, 1, 1, 1], size=n),
+        "taxonomy_category": rng.choice([0, 0, 1, 1, 2, 3, 4, 5], size=n),
+        "frequency_code_encoded": rng.choice([0, 1, 1, 1, 1, 7], size=n),
+        "payer_sequence_encoded": rng.choice([0, 1, 1, 1, 2], size=n),
+        "filing_lag_days": rng.lognormal(mean=3.0, sigma=0.8, size=n).clip(0, 365),
+        "charge_dx_ratio": rng.lognormal(mean=5.5, sigma=1.2, size=n).clip(10, 50000),
     }
     df = pd.DataFrame(data)
     df["charge_per_line"] = df["total_charge"] / df["service_line_count"]
 
+    # Label generation — reduced coefficients + increased noise
     prob = np.full(n, 0.15)
-    prob += df["modifier_missing"].values * 0.25
-    prob += (df["total_charge"].values > 5000).astype(float) * 0.12
-    prob += (df["dx_count"].values < 2).astype(float) * 0.10
-    prob += ((df["prior_auth_present"].values == 0) & (df["total_charge"].values > 3000)).astype(float) * 0.15
-    prob += df["payer_denial_rate"].values * 0.3
-    prob += df["cpt_denial_rate"].values * 0.2
-    prob += rng.normal(0, 0.05, size=n)
-    prob = prob.clip(0.01, 0.99)
+    prob += df["modifier_missing"].values * 0.15
+    prob += (df["total_charge"].values > 5000).astype(float) * 0.08
+    prob += (df["dx_count"].values < 2).astype(float) * 0.06
+    prob += ((df["prior_auth_present"].values == 0) & (df["total_charge"].values > 3000)).astype(float) * 0.10
+    prob += df["payer_denial_rate"].values * 0.15
+    prob += df["cpt_denial_rate"].values * 0.10
+    prob += data["invalid_npi"] * 0.10
+    prob += (np.array(data["duplicate_risk"]) > 0).astype(float) * 0.12
+    # New feature contributions
+    prob += (df["dx_specificity"].values < 4).astype(float) * 0.05
+    prob += (df["modifier_count"].values == 0).astype(float) * 0.05
+    prob += (df["filing_lag_days"].values > 90).astype(float) * 0.08
+    prob += rng.normal(0, 0.10, size=n)  # increased noise (was 0.05)
+    prob = prob.clip(0.05, 0.95)  # tighter clip (was 0.01, 0.99)
     labels = (rng.random(n) < prob).astype(int)
 
     return df[FEATURE_NAMES].fillna(0.0), labels

@@ -380,7 +380,7 @@ async def upload_835(file: UploadFile = File(...), session: AsyncSession = Depen
         last = await training_repo.get_latest_history(session)
         cooldown_ok = (
             not last
-            or (datetime.utcnow() - last["trained_at"]) > timedelta(days=AUTO_RETRAIN_INTERVAL_DAYS)
+            or (datetime.now(last["trained_at"].tzinfo) - last["trained_at"]) > timedelta(days=AUTO_RETRAIN_INTERVAL_DAYS)
         )
         if cooldown_ok:
             quality = await validate_training_data(session)

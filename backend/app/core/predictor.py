@@ -16,6 +16,7 @@ logger = structlog.get_logger()
 _model = None
 _model_loaded = False
 _model_version: str = "unknown"
+_model_feature_count: int | None = None
 
 # Shadow model slot for champion-challenger comparison
 _shadow_model = None
@@ -63,14 +64,16 @@ def set_model_version(version: str) -> None:
 
 def load_model() -> None:
     """Load XGBoost model from disk."""
-    global _model, _model_loaded, _model_version
+    global _model, _model_loaded, _model_version, _model_feature_count
 
     model_path = Path(settings.MODEL_DIR) / "demo_model.joblib"
     if model_path.exists():
         _model = joblib.load(model_path)
         _model_loaded = True
         _model_version = _detect_version_from_files()
-        logger.info("XGBoost model loaded", path=str(model_path), version=_model_version)
+        _model_feature_count = getattr(_model, "n_features_in_", None)
+        logger.info("XGBoost model loaded", path=str(model_path), version=_model_version,
+                     feature_count=_model_feature_count)
         # Initialize SHAP explainer
         try:
             from app.core.explainer import init_explainer
@@ -89,6 +92,11 @@ def is_model_loaded() -> bool:
 
 def get_model_version() -> str:
     return _model_version
+
+
+def get_model_feature_count() -> int | None:
+    """Return the number of features the loaded model expects, or None if unknown."""
+    return _model_feature_count
 
 
 def predict_proba(X: pd.DataFrame) -> np.ndarray:
@@ -141,8 +149,12 @@ def predict_shadow(X: pd.DataFrame) -> np.ndarray | None:
     """Score with the shadow model. Returns None if no shadow is loaded."""
     if _shadow_model is None:
         return None
-    probas = _shadow_model.predict_proba(X)
-    return probas[:, 1]
+    try:
+        probas = _shadow_model.predict_proba(X)
+        return probas[:, 1]
+    except ValueError as e:
+        logger.warning("Shadow model prediction failed, skipping", error=str(e))
+        return None
 
 
 def _fallback_predict(X: pd.DataFrame) -> np.ndarray:
@@ -162,6 +174,10 @@ def _fallback_predict(X: pd.DataFrame) -> np.ndarray:
             score += 0.15
         if row.get("prior_auth_present", 0) == 0 and row.get("total_charge", 0) > 1000:
             score += 0.1
+        if row.get("invalid_npi", 0) == 1:
+            score += 0.15
+        if row.get("duplicate_risk", 0) > 0.3:
+            score += 0.15
 
         scores[i] = min(score, 0.99)
 

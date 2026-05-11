@@ -101,6 +101,33 @@ async def update_attempt_outcome(
     return attempt.attempt_number
 
 
+_UNRESOLVED_ATTEMPT_STATUSES = ("PENDING", "SUBMITTED", "RESUBMITTED")
+
+
+async def get_pending_attempt_info(
+    session: AsyncSession, claim_id: str,
+) -> tuple[int, str | None]:
+    """Find the latest unresolved attempt for a claim.
+
+    Returns (attempt_number, attempt_type). Falls back to (1, None)
+    when no lifecycle or no pending attempt exists.
+    """
+    result = await session.execute(
+        select(LifecycleAttempt.attempt_number, LifecycleAttempt.attempt_type)
+        .join(ClaimLifecycle, ClaimLifecycle.id == LifecycleAttempt.lifecycle_id)
+        .where(
+            ClaimLifecycle.claim_id == claim_id,
+            LifecycleAttempt.status.in_(_UNRESOLVED_ATTEMPT_STATUSES),
+        )
+        .order_by(LifecycleAttempt.attempt_number.desc())
+        .limit(1)
+    )
+    row = result.one_or_none()
+    if row is not None:
+        return row[0], row[1]
+    return 1, None
+
+
 async def update_lifecycle_status(session: AsyncSession, claim_id: str, status: str) -> None:
     await session.execute(
         update(ClaimLifecycle)

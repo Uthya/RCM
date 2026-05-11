@@ -61,6 +61,10 @@ async def count_denied(session: AsyncSession) -> int:
     return result.scalar() or 0
 
 
+DENIAL_PRIOR = 0.15
+DENIAL_PRIOR_STRENGTH = 20
+
+
 async def get_denial_rate(session: AsyncSession, filter_col: str, filter_val: str) -> float:
     """Get denial rate for a given filter (e.g., payer_name, payee_npi)."""
     col = getattr(Remittance, filter_col, None)
@@ -80,6 +84,28 @@ async def get_denial_rate(session: AsyncSession, filter_col: str, filter_val: st
     return denied / total
 
 
+async def get_denial_rate_with_count(
+    session: AsyncSession, filter_col: str, filter_val: str,
+) -> tuple[float, int]:
+    """Bayesian-smoothed denial rate + sample count."""
+    col = getattr(Remittance, filter_col, None)
+    if col is None:
+        return DENIAL_PRIOR, 0
+    total_result = await session.execute(
+        select(func.count()).select_from(Remittance).where(col == filter_val)
+    )
+    total = total_result.scalar() or 0
+    if total == 0:
+        return DENIAL_PRIOR, 0
+    denied_result = await session.execute(
+        select(func.count()).select_from(Remittance)
+        .where(col == filter_val, Remittance.claim_status == "denied")
+    )
+    denied = denied_result.scalar() or 0
+    smoothed = (denied + DENIAL_PRIOR * DENIAL_PRIOR_STRENGTH) / (total + DENIAL_PRIOR_STRENGTH)
+    return smoothed, total
+
+
 async def get_cpt_denial_rate(session: AsyncSession, cpt_code: str) -> float:
     """Get denial rate for a specific CPT code using JSONB service_lines."""
     stmt = text("""
@@ -93,6 +119,24 @@ async def get_cpt_denial_rate(session: AsyncSession, cpt_code: str) -> float:
     if row.total == 0:
         return 0.0
     return row.denied / row.total
+
+
+async def get_cpt_denial_rate_with_count(
+    session: AsyncSession, cpt_code: str,
+) -> tuple[float, int]:
+    """Bayesian-smoothed CPT denial rate + sample count."""
+    stmt = text("""
+        SELECT COUNT(*) AS total,
+               COUNT(*) FILTER (WHERE r.claim_status = 'denied') AS denied
+        FROM remittances r, jsonb_array_elements(r.service_lines) AS sl
+        WHERE sl->>'cpt_code' = :cpt_code
+    """)
+    result = await session.execute(stmt, {"cpt_code": cpt_code})
+    row = result.one()
+    if row.total == 0:
+        return DENIAL_PRIOR, 0
+    smoothed = (row.denied + DENIAL_PRIOR * DENIAL_PRIOR_STRENGTH) / (row.total + DENIAL_PRIOR_STRENGTH)
+    return smoothed, row.total
 
 
 async def get_total_paid(session: AsyncSession) -> float:

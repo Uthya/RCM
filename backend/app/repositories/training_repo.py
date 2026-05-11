@@ -10,11 +10,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import MLTrainingData, MLTrainingDataArchive, TrainingHistory
 
 
-async def find_existing(session: AsyncSession, claim_id: str) -> bool:
-    """Check if a training record exists for a claim."""
-    result = await session.execute(
-        select(MLTrainingData.id).where(MLTrainingData.claim_id == claim_id).limit(1)
-    )
+async def find_existing(session: AsyncSession, claim_id: str, attempt_number: int | None = None) -> bool:
+    """Check if a training record exists for a claim (optionally for a specific attempt)."""
+    stmt = select(MLTrainingData.id).where(MLTrainingData.claim_id == claim_id)
+    if attempt_number is not None:
+        stmt = stmt.where(MLTrainingData.attempt_number == attempt_number)
+    result = await session.execute(stmt.limit(1))
     return result.scalar_one_or_none() is not None
 
 
@@ -28,6 +29,7 @@ async def get_training_data(
     *,
     created_after: datetime | None = None,
     feature_version: str | None = None,
+    first_attempt_only: bool = False,
     limit: int = 100_000,
 ) -> list[dict]:
     """Fetch training records with optional filters."""
@@ -36,6 +38,9 @@ async def get_training_data(
         stmt = stmt.where(MLTrainingData.created_at >= created_after)
     if feature_version:
         stmt = stmt.where(MLTrainingData.feature_version == feature_version)
+    if first_attempt_only:
+        stmt = stmt.where(MLTrainingData.is_first_attempt == True)  # noqa: E712
+    stmt = stmt.order_by(MLTrainingData.created_at.asc())
     stmt = stmt.limit(limit)
     result = await session.execute(stmt)
     return [_to_dict(r) for r in result.scalars().all()]

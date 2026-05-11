@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select, func, update
+from sqlalchemy import select, func, update, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -101,6 +101,43 @@ async def get_claims_by_ids(session: AsyncSession, claim_ids: list[str]) -> list
         select(Claim).where(Claim.claim_id.in_(claim_ids))
     )
     return [_claim_to_dict(c) for c in result.scalars().all()]
+
+
+async def count_similar_claims(
+    session: AsyncSession,
+    claim_id: str,
+    subscriber_id: str,
+    billing_provider_npi: str,
+    cpt_codes: list[str],
+    service_dates: list[str],
+) -> int:
+    """Content-based duplicate detection.
+
+    Matches on subscriber_id + billing_provider_npi + overlapping
+    CPT code AND service date in JSONB service_lines.
+    """
+    if not subscriber_id or not billing_provider_npi:
+        return 0
+
+    stmt = text("""
+        SELECT COUNT(DISTINCT c.id) FROM claims c
+        WHERE c.claim_id != :claim_id
+          AND c.subscriber_id = :subscriber_id
+          AND c.billing_provider_npi = :billing_provider_npi
+          AND EXISTS (
+            SELECT 1 FROM jsonb_array_elements(c.service_lines) sl
+            WHERE sl->>'cpt_code' = ANY(:cpt_codes)
+              AND sl->>'service_date' = ANY(:service_dates)
+          )
+    """)
+    result = await session.execute(stmt, {
+        "claim_id": claim_id,
+        "subscriber_id": subscriber_id,
+        "billing_provider_npi": billing_provider_npi,
+        "cpt_codes": cpt_codes,
+        "service_dates": service_dates,
+    })
+    return result.scalar() or 0
 
 
 async def update_claim_fields(session: AsyncSession, claim_id: str, fields: dict) -> None:

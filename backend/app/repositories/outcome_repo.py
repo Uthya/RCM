@@ -31,11 +31,15 @@ async def upsert_outcome(session: AsyncSession, doc: dict) -> bool:
     return is_new
 
 
-async def find_outcome(session: AsyncSession, claim_id: str) -> dict | None:
-    result = await session.execute(
-        select(ClaimOutcome).where(ClaimOutcome.claim_id == claim_id).order_by(ClaimOutcome.attempt_number.desc())
-    )
-    o = result.scalar_one_or_none()
+async def find_outcome(
+    session: AsyncSession, claim_id: str, attempt_number: int | None = None,
+) -> dict | None:
+    stmt = select(ClaimOutcome).where(ClaimOutcome.claim_id == claim_id)
+    if attempt_number is not None:
+        stmt = stmt.where(ClaimOutcome.attempt_number == attempt_number)
+    stmt = stmt.order_by(ClaimOutcome.attempt_number.desc())
+    result = await session.execute(stmt)
+    o = result.scalars().first()
     if not o:
         return None
     return _to_dict(o)

@@ -111,14 +111,28 @@ def parse_835(raw: str) -> list[ParsedRemittance]:
                 current_svc = _parse_svc(els)
                 remit.service_lines.append(current_svc)
 
+            elif seg_id == "LQ":
+                # RARC (Remittance Advice Remark Code): LQ*HE*<code>
+                qualifier = get_element(els, 1)
+                rarc = get_element(els, 2)
+                if qualifier == "HE" and rarc:
+                    remit.rarc_codes.append(rarc)
+
             elif seg_id == "NM1":
                 qualifier = get_element(els, 1)
                 if qualifier in ("82", "85"):
                     remit.payee_name = remit.payee_name or _build_name(els)
                     remit.payee_npi = remit.payee_npi or get_element(els, 9)
 
-        # Deduplicate CARC codes
+        # Deduplicate CARC codes and RARC codes
         remit.carc_codes = list(dict.fromkeys(remit.carc_codes))
+        remit.rarc_codes = list(dict.fromkeys(remit.rarc_codes))
+
+        # Override status when payment data contradicts the status code
+        if remit.claim_status == "paid" and remit.paid_amount == 0 and remit.carc_codes:
+            remit.claim_status = "denied"
+        elif remit.claim_status == "paid" and remit.paid_amount > 0 and remit.paid_amount < remit.billed_amount and remit.carc_codes:
+            remit.claim_status = "partial"
 
         remittances.append(remit)
 

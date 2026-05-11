@@ -12,6 +12,7 @@ from app.core.feature_engineer import (
     compute_features_from_claim,
     enrich_with_historical_rates,
     features_to_dataframe,
+    align_features_for_model,
 )
 from app.core.predictor import (
     predict_proba, get_model_version,
@@ -59,6 +60,7 @@ async def predict_claim(session: AsyncSession, claim_id: str) -> PredictResponse
     features = await enrich_with_historical_rates(session, features, claim_doc)
 
     df = features_to_dataframe([features])
+    df = align_features_for_model(df)
     proba = predict_proba(df)
     risk_score = round(float(proba[0]), 4)
     risk_level = _classify_risk(risk_score)
@@ -146,6 +148,7 @@ async def predict_batch(session: AsyncSession, claim_ids: list[str] | None = Non
         feature_list = await asyncio.gather(*enrichment_tasks)
 
         df = features_to_dataframe(feature_list)
+        df = align_features_for_model(df)
         probas = predict_proba(df)
         explanations = explain(df, top_n=3)
         model_ver = get_model_version()

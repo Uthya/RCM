@@ -17,6 +17,29 @@ from dataclasses import dataclass, field
 _CPT_RE = re.compile(r"^[0-9]{5}$")
 _HCPCS_RE = re.compile(r"^[A-Z][0-9]{4}$")
 
+
+def classify_issue_type(reason_text: str) -> str | None:
+    """Single source of truth for issue type classification."""
+    r = reason_text.split("\n")[0].lower()
+    if "missing modifier" in r:
+        return "missing_modifier"
+    if "invalid cpt" in r or "invalid hcpcs" in r:
+        return "invalid_cpt"
+    if "prior authorization" in r:
+        return "missing_prior_auth"
+    if "vague" in r and "diagnosis" in r:
+        return "vague_diagnosis"
+    if "only 1 diagnosis" in r or "weak clinical" in r:
+        return "weak_diagnosis"
+    if "missing" in r and "npi" in r:
+        return "missing_npi"
+    if "missing" in r and "date of birth" in r:
+        return "missing_dob"
+    if "missing" in r and "payer" in r and "identification" in r:
+        return "missing_payer_id"
+    return None
+
+
 # Categories by code prefix / range
 CPT_CATEGORIES: dict[str, dict] = {
     # E/M
@@ -379,15 +402,8 @@ async def validate_claim(claim, prediction) -> ClaimValidation:
     try:
         from app.services.knowledge_store import get_best_fix
         for iss in issues:
-            # Determine issue type from reason text
-            reason_first = iss.reason.split("\n")[0].lower()
-            if "missing modifier" in reason_first:
-                issue_type = "missing_modifier"
-            elif "invalid cpt" in reason_first:
-                issue_type = "invalid_cpt"
-            elif "prior authorization" in reason_first:
-                issue_type = "missing_prior_auth"
-            else:
+            issue_type = classify_issue_type(iss.reason)
+            if not issue_type:
                 continue
 
             best = await get_best_fix(issue_type, payer, primary_cpt)
