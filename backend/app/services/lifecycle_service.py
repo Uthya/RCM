@@ -49,17 +49,123 @@ def _service_lines_summary(claim) -> list[dict]:
     return result
 
 
+def _serialize_claim_snapshot(claim) -> dict:
+    """Create an immutable, normalized snapshot of claim data for comparison.
+
+    Both sides of detect_fix_applied() must go through this function
+    to eliminate asymmetric type coercion.
+    """
+    slines = _service_lines_summary(claim)
+    return {
+        # Claim-level fields (normalized to str)
+        "claim_id": str(_claim_field(claim, "claim_id", "") or ""),
+        "total_charge": float(_claim_field(claim, "total_charge", 0.0) or 0.0),
+        "diagnosis_codes": sorted(str(d) for d in (_claim_field(claim, "diagnosis_codes", []) or [])),
+        "prior_auth_number": str(_claim_field(claim, "prior_auth_number", "") or ""),
+        "place_of_service": str(_claim_field(claim, "place_of_service", "") or ""),
+        "frequency_code": str(_claim_field(claim, "frequency_code", "") or ""),
+        "subscriber_id": str(_claim_field(claim, "subscriber_id", "") or ""),
+        "billing_provider_npi": str(_claim_field(claim, "billing_provider_npi", "") or ""),
+        "rendering_provider_npi": str(_claim_field(claim, "rendering_provider_npi", "") or ""),
+        "provider_taxonomy": str(_claim_field(claim, "provider_taxonomy", "") or ""),
+        "payer_id": str(_claim_field(claim, "payer_id", "") or ""),
+        "payer_name": str(_claim_field(claim, "payer_name", "") or ""),
+        "group_number": str(_claim_field(claim, "group_number", "") or ""),
+        "patient_dob": str(_claim_field(claim, "patient_dob", "") or ""),
+        "patient_gender": str(_claim_field(claim, "patient_gender", "") or ""),
+        # EDI envelope fields (previously lost from features dict)
+        "transaction_reference": str(_claim_field(claim, "transaction_reference", "") or ""),
+        "sender_id": str(_claim_field(claim, "sender_id", "") or ""),
+        "receiver_id": str(_claim_field(claim, "receiver_id", "") or ""),
+        "interchange_control_number": str(_claim_field(claim, "interchange_control_number", "") or ""),
+        # Full service lines (normalized)
+        "service_lines": slines,
+    }
+
+
+def _classify_attempt_type(frequency_code: str | None, attempt_number: int) -> str:
+    """Classify attempt type from EDI frequency code (CLM05-3).
+
+    Frequency code takes priority: a first transmission can still be
+    a void (8) or replacement (7) in payer-initiated workflows.
+    """
+    if frequency_code == "8":
+        return "VOID"
+    if frequency_code == "7":
+        return "REPLACEMENT"
+    if frequency_code == "6":
+        return "CORRECTED"
+    if attempt_number == 1:
+        return "ORIGINAL"
+    return "RESUBMISSION"
+
+
 # ---------------------------------------------------------------------------
 # detect_fix_applied
 # ---------------------------------------------------------------------------
 
-def detect_fix_applied(claim, previous_attempt: dict) -> str:
-    changes: list[str] = []
+_FIELD_LABELS = {
+    "place_of_service": "place of service",
+    "frequency_code": "frequency code",
+    "subscriber_id": "subscriber/member ID",
+    "billing_provider_npi": "billing provider NPI",
+    "rendering_provider_npi": "rendering provider NPI",
+    "provider_taxonomy": "provider taxonomy",
+    "payer_id": "payer ID",
+    "payer_name": "payer name",
+    "group_number": "group number",
+    "patient_dob": "patient DOB",
+    "patient_gender": "patient gender",
+}
+
+_FIELD_CATEGORY = {
+    "place_of_service": "place_of_service",
+    "frequency_code": "frequency_code",
+    "subscriber_id": "subscriber_id",
+    "billing_provider_npi": "npi",
+    "rendering_provider_npi": "npi",
+    "provider_taxonomy": "other",
+    "payer_id": "payer_id",
+    "payer_name": "other",
+    "group_number": "other",
+    "patient_dob": "patient_dob",
+    "patient_gender": "other",
+}
+
+
+def detect_fix_applied(claim, previous_attempt: dict) -> dict:
+    """Compare current claim against previous attempt and return categorized changes.
+
+    Uses symmetric snapshot comparison when available (_raw_snapshot),
+    falling back to old asymmetric features dict for backward compatibility.
+
+    Returns dict with category keys mapping to lists of change descriptions,
+    plus a '_flat' key with all changes joined as a semicolon-separated string.
+    """
+    categorized: dict[str, list[str]] = {
+        "modifier": [], "diagnosis": [], "prior_auth": [], "charge": [],
+        "place_of_service": [], "frequency_code": [], "subscriber_id": [],
+        "npi": [], "patient_dob": [], "payer_id": [], "cpt": [],
+        "service_line_count": [], "units": [], "service_date": [], "other": [],
+    }
+
+    curr = _serialize_claim_snapshot(claim)
+
     prev_features = previous_attempt.get("features", {})
+    prev_snapshot = prev_features.get("_raw_snapshot")
 
-    prev_slines = previous_attempt.get("service_lines", [])
-    curr_slines = _service_lines_summary(claim)
+    if prev_snapshot:
+        # Symmetric comparison: both sides from _serialize_claim_snapshot
+        prev = prev_snapshot
+        prev_slines = prev.get("service_lines", [])
+    else:
+        # Backward compat: old data without snapshot
+        prev = prev_features
+        prev_slines = previous_attempt.get("service_lines", [])
 
+    curr_slines = curr.get("service_lines", [])
+
+    # ── Modifier changes per CPT ──
     prev_mods_by_cpt: dict[str, set] = {}
     for sl in prev_slines:
         cpt = sl.get("cpt_code", "")
@@ -77,32 +183,98 @@ def detect_fix_applied(claim, previous_attempt: dict) -> str:
         added = curr_m - prev_m
         removed = prev_m - curr_m
         if added:
-            changes.append(f"Added modifier {', '.join(sorted(added))} to {cpt}")
+            categorized["modifier"].append(f"Added modifier {', '.join(sorted(added))} to {cpt}")
         if removed:
-            changes.append(f"Removed modifier {', '.join(sorted(removed))} from {cpt}")
+            categorized["modifier"].append(f"Removed modifier {', '.join(sorted(removed))} from {cpt}")
 
-    prev_dx = set(prev_features.get("diagnosis_codes", []))
-    curr_dx = set(_claim_field(claim, "diagnosis_codes", []))
+    # ── Diagnosis code changes ──
+    prev_dx = set(prev.get("diagnosis_codes", []))
+    curr_dx = set(curr.get("diagnosis_codes", []))
     added_dx = curr_dx - prev_dx
     removed_dx = prev_dx - curr_dx
     if added_dx:
-        changes.append(f"Added diagnosis {', '.join(sorted(added_dx))}")
+        categorized["diagnosis"].append(f"Added diagnosis {', '.join(sorted(added_dx))}")
     if removed_dx:
-        changes.append(f"Removed diagnosis {', '.join(sorted(removed_dx))}")
+        categorized["diagnosis"].append(f"Removed diagnosis {', '.join(sorted(removed_dx))}")
 
-    prev_auth = prev_features.get("prior_auth_number", "")
-    curr_auth = _claim_field(claim, "prior_auth_number", "")
+    # ── Prior authorization ──
+    prev_auth = str(prev.get("prior_auth_number", "") or "")
+    curr_auth = str(curr.get("prior_auth_number", "") or "")
     if curr_auth and not prev_auth:
-        changes.append("Added prior authorization")
+        categorized["prior_auth"].append("Added prior authorization")
     elif prev_auth and not curr_auth:
-        changes.append("Removed prior authorization")
+        categorized["prior_auth"].append("Removed prior authorization")
+    elif prev_auth and curr_auth and prev_auth != curr_auth:
+        categorized["prior_auth"].append(f"Changed prior authorization from {prev_auth} to {curr_auth}")
 
-    prev_charge = prev_features.get("total_charge", 0.0)
-    curr_charge = float(_claim_field(claim, "total_charge", 0.0))
+    # ── Total charge ──
+    prev_charge = float(prev.get("total_charge", 0.0) or 0.0)
+    curr_charge = float(curr.get("total_charge", 0.0) or 0.0)
     if prev_charge and curr_charge and abs(curr_charge - prev_charge) > 0.01:
-        changes.append(f"Changed total charge from {prev_charge} to {curr_charge}")
+        categorized["charge"].append(f"Changed total charge from {prev_charge} to {curr_charge}")
 
-    return "; ".join(changes)
+    # ── Claim-level field comparisons ──
+    for field_key, label in _FIELD_LABELS.items():
+        prev_val = str(prev.get(field_key, "") or "")
+        curr_val = str(curr.get(field_key, "") or "")
+        if prev_val != curr_val:
+            cat = _FIELD_CATEGORY[field_key]
+            if curr_val and not prev_val:
+                categorized[cat].append(f"Added {label}: {curr_val}")
+            elif prev_val and not curr_val:
+                categorized[cat].append(f"Removed {label}")
+            else:
+                categorized[cat].append(f"Changed {label} from {prev_val} to {curr_val}")
+
+    # ── Service-line level comparisons ──
+    prev_cpts = set(sl.get("cpt_code", "") for sl in prev_slines)
+    curr_cpts = set(sl.get("cpt_code", "") for sl in curr_slines)
+    added_cpts = curr_cpts - prev_cpts
+    removed_cpts = prev_cpts - curr_cpts
+    if added_cpts:
+        categorized["cpt"].append(f"Added CPT codes: {', '.join(sorted(added_cpts))}")
+    if removed_cpts:
+        categorized["cpt"].append(f"Removed CPT codes: {', '.join(sorted(removed_cpts))}")
+
+    if len(prev_slines) != len(curr_slines):
+        categorized["service_line_count"].append(
+            f"Service line count changed from {len(prev_slines)} to {len(curr_slines)}"
+        )
+
+    # Per-line unit, charge, and date changes (match by CPT)
+    prev_by_cpt: dict[str, list[dict]] = {}
+    for sl in prev_slines:
+        prev_by_cpt.setdefault(sl.get("cpt_code", ""), []).append(sl)
+    curr_by_cpt: dict[str, list[dict]] = {}
+    for sl in curr_slines:
+        curr_by_cpt.setdefault(sl.get("cpt_code", ""), []).append(sl)
+
+    for cpt in sorted(prev_cpts & curr_cpts):
+        p_lines = prev_by_cpt.get(cpt, [])
+        c_lines = curr_by_cpt.get(cpt, [])
+        for i in range(min(len(p_lines), len(c_lines))):
+            p_units = p_lines[i].get("units", 0)
+            c_units = c_lines[i].get("units", 0)
+            if p_units != c_units:
+                categorized["units"].append(f"Changed units for {cpt} from {p_units} to {c_units}")
+
+            p_chg = float(p_lines[i].get("charge_amount", 0.0))
+            c_chg = float(c_lines[i].get("charge_amount", 0.0))
+            if abs(p_chg - c_chg) > 0.01:
+                categorized["charge"].append(f"Changed charge for {cpt} from {p_chg} to {c_chg}")
+
+            p_date = p_lines[i].get("service_date", "")
+            c_date = c_lines[i].get("service_date", "")
+            if p_date != c_date and (p_date or c_date):
+                categorized["service_date"].append(f"Changed service date for {cpt} from {p_date} to {c_date}")
+
+    # Build flat summary
+    all_changes: list[str] = []
+    for cat in sorted(categorized):
+        all_changes.extend(categorized[cat])
+    result = dict(categorized)
+    result["_flat"] = "; ".join(all_changes)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +303,15 @@ async def create_or_update_lifecycle(
         "prior_auth_number": _claim_field(claim, "prior_auth_number", ""),
         "place_of_service": _claim_field(claim, "place_of_service", ""),
         "frequency_code": freq_code,
+        "subscriber_id": _claim_field(claim, "subscriber_id", ""),
+        "billing_provider_npi": _claim_field(claim, "billing_provider_npi", ""),
+        "rendering_provider_npi": _claim_field(claim, "rendering_provider_npi", ""),
+        "provider_taxonomy": _claim_field(claim, "provider_taxonomy", ""),
+        "payer_id": _claim_field(claim, "payer_id", ""),
+        "payer_name": _claim_field(claim, "payer_name", ""),
+        "group_number": _claim_field(claim, "group_number", ""),
+        "patient_dob": _claim_field(claim, "patient_dob", ""),
+        "patient_gender": _claim_field(claim, "patient_gender", ""),
     }
 
     service_lines = _service_lines_summary(claim)
@@ -156,15 +337,18 @@ async def create_or_update_lifecycle(
         # Resubmission: append new attempt
         attempts = existing.get("attempts", [])
         prev_attempt = attempts[-1] if attempts else {}
-        fix_applied = detect_fix_applied(claim, prev_attempt) if prev_attempt else ""
+        fix_changes = detect_fix_applied(claim, prev_attempt) if prev_attempt else {}
+        fix_applied = fix_changes.get("_flat", "") if fix_changes else ""
         attempt_number = existing.get("total_attempts", len(attempts)) + 1
 
+        snapshot = _serialize_claim_snapshot(claim)
         new_attempt = {
             "attempt_number": attempt_number,
+            "attempt_type": _classify_attempt_type(freq_code, attempt_number),
             "submitted_at": now,
             "frequency_code": freq_code,
             "fix_applied": fix_applied,
-            "features": features,
+            "features": {**features, "_raw_snapshot": snapshot, "_fix_changes": fix_changes},
             "service_lines": service_lines,
             "prediction_risk_score": risk_score,
             "prediction_risk_level": risk_level,
@@ -191,11 +375,13 @@ async def create_or_update_lifecycle(
                     fix_applied=fix_applied or "(none detected)")
     else:
         # First submission
+        snapshot = _serialize_claim_snapshot(claim)
         first_attempt = {
             "attempt_number": 1,
+            "attempt_type": _classify_attempt_type(freq_code, 1),
             "submitted_at": now,
             "frequency_code": freq_code,
-            "features": features,
+            "features": {**features, "_raw_snapshot": snapshot},
             "service_lines": service_lines,
             "prediction_risk_score": risk_score,
             "prediction_risk_level": risk_level,
@@ -265,6 +451,15 @@ async def update_lifecycle_outcome(
             "prior_auth_number": claim_doc.get("prior_auth_number", ""),
             "place_of_service": claim_doc.get("place_of_service", ""),
             "frequency_code": claim_doc.get("frequency_code", "1"),
+            "subscriber_id": claim_doc.get("subscriber_id", ""),
+            "billing_provider_npi": claim_doc.get("billing_provider_npi", ""),
+            "rendering_provider_npi": claim_doc.get("rendering_provider_npi", ""),
+            "provider_taxonomy": claim_doc.get("provider_taxonomy", ""),
+            "payer_id": claim_doc.get("payer_id", ""),
+            "payer_name": claim_doc.get("payer_name", ""),
+            "group_number": claim_doc.get("group_number", ""),
+            "patient_dob": claim_doc.get("patient_dob", ""),
+            "patient_gender": claim_doc.get("patient_gender", ""),
         }
 
         pred = await prediction_repo.find_prediction(session, claim_id)
@@ -272,10 +467,12 @@ async def update_lifecycle_outcome(
         risk_level = pred.get("risk_level", "LOW") if pred else "LOW"
         model_version = pred.get("model_version", "unknown") if pred else "unknown"
 
+        backfill_freq = claim_doc.get("frequency_code", "1")
         backfilled_attempt = {
             "attempt_number": 1,
+            "attempt_type": _classify_attempt_type(backfill_freq, 1),
             "submitted_at": claim_doc.get("created_at", now),
-            "frequency_code": claim_doc.get("frequency_code", "1"),
+            "frequency_code": backfill_freq,
             "features": features,
             "service_lines": slines,
             "prediction_risk_score": risk_score,

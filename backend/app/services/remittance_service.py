@@ -7,8 +7,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.repositories import (
     remittance_repo, claim_repo, outcome_repo, prediction_repo, training_repo,
+    lifecycle_repo,
 )
 from app.schemas.remittance import ParsedRemittance, RemittanceResponse
+from app.services.claim_rules import classify_issue_type
 
 logger = structlog.get_logger()
 
@@ -54,15 +56,16 @@ async def _create_training_record(
     claim_id: str,
     remit,
     claim: dict,
+    attempt_number: int = 1,
 ) -> bool:
     """Join prediction features with 835 outcome into ml_training_data.
 
-    CRITICAL: Only creates a record for the FIRST 835 outcome per claim.
+    Creates one record per (claim_id, attempt_number) pair.
     Returns True if a record was created, False otherwise.
     """
-    existing = await training_repo.find_existing(session, claim_id)
+    existing = await training_repo.find_existing(session, claim_id, attempt_number=attempt_number)
     if existing:
-        logger.debug("Training record already exists, skipping (first-attempt only)", claim_id=claim_id)
+        logger.debug("Training record already exists for attempt", claim_id=claim_id, attempt_number=attempt_number)
         return False
 
     prediction = await prediction_repo.find_prediction(session, claim_id)
@@ -77,8 +80,8 @@ async def _create_training_record(
 
     training_doc = {
         "claim_id": claim_id,
-        "attempt_number": 1,
-        "is_first_attempt": True,
+        "attempt_number": attempt_number,
+        "is_first_attempt": (attempt_number == 1),
         "features": prediction["features"],
         "label": label,
         "actual_outcome": remit.claim_status,
@@ -96,7 +99,7 @@ async def _create_training_record(
     }
 
     await training_repo.insert_record(session, training_doc)
-    logger.info("Training record created (first attempt)", claim_id=claim_id, label=label)
+    logger.info("Training record created", claim_id=claim_id, attempt_number=attempt_number, label=label)
     return True
 
 
@@ -120,14 +123,22 @@ async def store_remittances(session: AsyncSession, remittances: list[ParsedRemit
 
         claim = await claim_repo.find_claim(session, remit.claim_id)
         if claim:
-            existing_outcome = await outcome_repo.find_outcome(session, remit.claim_id)
+            # Resolve which attempt this 835 belongs to
+            attempt_number, attempt_type = await lifecycle_repo.get_pending_attempt_info(
+                session, remit.claim_id,
+            )
+
+            existing_outcome = await outcome_repo.find_outcome(
+                session, remit.claim_id, attempt_number=attempt_number,
+            )
             if not existing_outcome:
                 new_outcomes += 1
 
             carc_descs = _enrich_carc_descriptions(remit.carc_codes)
             is_new = await outcome_repo.upsert_outcome(session, {
                 "claim_id": remit.claim_id,
-                "attempt_number": 1,
+                "attempt_number": attempt_number,
+                "attempt_type": attempt_type,
                 "outcome_status": remit.claim_status,
                 "paid_amount": remit.paid_amount,
                 "carc_codes": remit.carc_codes,
@@ -135,11 +146,15 @@ async def store_remittances(session: AsyncSession, remittances: list[ParsedRemit
                 "created_at": datetime.utcnow(),
             })
             matched += 1
-            logger.info("Matched 835 to claim", claim_id=remit.claim_id, status=remit.claim_status)
+            logger.info("Matched 835 to claim", claim_id=remit.claim_id, status=remit.claim_status,
+                        attempt_number=attempt_number)
 
             # Training data join
             try:
-                created = await _create_training_record(session, remit.claim_id, remit, claim)
+                created = await _create_training_record(
+                    session, remit.claim_id, remit, claim,
+                    attempt_number=attempt_number,
+                )
                 if created:
                     training_records_created += 1
             except Exception as e:
@@ -153,9 +168,11 @@ async def store_remittances(session: AsyncSession, remittances: list[ParsedRemit
             except Exception as e:
                 logger.warning("Failed to update lifecycle outcome", claim_id=remit.claim_id, error=str(e))
 
-            # Knowledge layer: record fix outcomes
+            # Knowledge layer: record fix outcomes with relevance filtering
             try:
-                from app.services.knowledge_store import record_fix
+                from app.services.knowledge_store import (
+                    record_fix, CARC_FIX_MAP, filter_changes_for_issue,
+                )
                 payer = claim.get("payer_name", "")
                 slines = claim.get("service_lines", [])
                 cpt = slines[0].get("cpt_code", "") if slines else ""
@@ -170,52 +187,60 @@ async def store_remittances(session: AsyncSession, remittances: list[ParsedRemit
                     latest = attempts[-1] if attempts else {}
                     first = attempts[0] if attempts else {}
                     fix_applied_text = latest.get("fix_applied", "")
+                    fix_changes = latest.get("features", {}).get("_fix_changes", {})
 
                     if fix_applied_text:
                         first_issues = first.get("validation_issues", [])
                         for iss in first_issues:
-                            reason_first = iss.get("reason", "").split("\n")[0].lower()
-                            if "missing modifier" in reason_first:
-                                issue_type = "missing_modifier"
-                            elif "invalid cpt" in reason_first:
-                                issue_type = "invalid_cpt"
-                            elif "prior authorization" in reason_first:
-                                issue_type = "missing_prior_auth"
-                            else:
+                            issue_type = classify_issue_type(iss.get("reason", ""))
+                            if not issue_type:
+                                continue
+                            # Filter to only relevant changes for this issue type
+                            relevant_text = (
+                                filter_changes_for_issue(fix_changes, issue_type)
+                                if fix_changes else fix_applied_text
+                            )
+                            if not relevant_text:
                                 continue
                             await record_fix(
                                 session,
                                 claim_id=remit.claim_id,
                                 issue_type=issue_type,
-                                fix_applied=fix_applied_text,
+                                fix_applied=relevant_text,
                                 payer_name=payer,
                                 cpt_code=cpt,
                                 outcome=remit.claim_status,
+                                attempt_number=attempt_number,
                             )
-                elif remit.claim_status == "paid":
-                    validation_issues = claim.get("validation_issues", [])
-                    if validation_issues:
-                        for iss in validation_issues:
-                            reason_first = iss.get("reason", "").split("\n")[0].lower()
-                            if "missing modifier" in reason_first:
-                                issue_type = "missing_modifier"
-                            elif "invalid cpt" in reason_first:
-                                issue_type = "invalid_cpt"
-                            elif "prior authorization" in reason_first:
-                                issue_type = "missing_prior_auth"
-                            else:
+
+                    # CARC correlation: map previous denial codes to filtered fix outcomes
+                    prev_denied = [
+                        a for a in attempts[:-1]
+                        if a.get("status") == "DENIED" and a.get("denial_codes")
+                    ]
+                    if prev_denied:
+                        prev_denial_codes = prev_denied[-1].get("denial_codes", [])
+                        for code in prev_denial_codes:
+                            carc_issue_type = CARC_FIX_MAP.get(code)
+                            if not carc_issue_type:
                                 continue
-                            fixes = iss.get("fixes", [])
-                            fix_text = fixes[0] if fixes else "unknown"
+                            relevant_text = (
+                                filter_changes_for_issue(fix_changes, carc_issue_type)
+                                if fix_changes else (fix_applied_text or "Resubmission (no field changes detected)")
+                            )
+                            if not relevant_text:
+                                continue
                             await record_fix(
                                 session,
                                 claim_id=remit.claim_id,
-                                issue_type=issue_type,
-                                fix_applied=fix_text,
+                                issue_type=carc_issue_type,
+                                fix_applied=relevant_text,
                                 payer_name=payer,
                                 cpt_code=cpt,
                                 outcome=remit.claim_status,
+                                attempt_number=attempt_number,
                             )
+                # Paid first-attempts are NOT recorded — no fix was actually applied
             except Exception as e:
                 logger.warning("Failed to record fix", error=str(e))
 
