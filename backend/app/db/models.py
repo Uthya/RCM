@@ -497,3 +497,57 @@ class CptRiskConfig(Base):
     weight: Mapped[float] = mapped_column(Float, default=0.0)
     label: Mapped[str | None] = mapped_column(String(64))
     reason: Mapped[str | None] = mapped_column(Text)
+
+    __table_args__ = (
+        UniqueConstraint("cpt_prefix", name="uq_cpt_risk_config_prefix"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# 17. adaptive_rules
+# ---------------------------------------------------------------------------
+
+class AdaptiveRule(Base):
+    __tablename__ = "adaptive_rules"
+
+    id = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+
+    # Rule identity (composite unique key)
+    rule_type        = mapped_column(String(64), nullable=False)
+    payer_name       = mapped_column(String(256), nullable=False)
+    cpt_code         = mapped_column(String(16), nullable=False, default="")
+    carc_code        = mapped_column(String(16), nullable=False, default="")
+    diagnosis_code   = mapped_column(String(16), nullable=False, default="")
+
+    # Rule content
+    rule_description = mapped_column(Text, nullable=False)
+    fix_suggestion   = mapped_column(Text, nullable=False)
+    issue_type       = mapped_column(String(64), nullable=False)
+
+    # Evidence
+    total_claims     = mapped_column(Integer, default=0)
+    denied_claims    = mapped_column(Integer, default=0)
+    denial_rate      = mapped_column(Float, default=0.0)
+
+    # Confidence lifecycle
+    confidence_level = mapped_column(String(8), default="LOW")
+    severity         = mapped_column(String(8), default="INFO")
+    is_active        = mapped_column(Boolean, default=True)
+    threshold_value  = mapped_column(Float, nullable=True)
+
+    # Timestamps
+    last_mined_at    = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at       = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at       = mapped_column(DateTime(timezone=True), server_default=func.now())
+    retired_at       = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Operator overrides
+    operator_approved = mapped_column(Boolean, nullable=True)
+    operator_notes    = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        UniqueConstraint("rule_type", "payer_name", "cpt_code", "carc_code", "diagnosis_code",
+                         name="uq_adaptive_rules_identity"),
+        Index("ix_adaptive_rules_payer_active", "payer_name", "is_active"),
+        Index("ix_adaptive_rules_confidence", "confidence_level", "severity"),
+    )

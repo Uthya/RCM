@@ -28,6 +28,13 @@ _background_jobs: dict[str, dict] = {}
 @router.post("/837")
 async def upload_837(file: UploadFile = File(...), session: AsyncSession = Depends(get_db)):
     """Upload and parse an 837 Professional EDI file."""
+    # Block duplicate filename
+    if file.filename and await config_repo.file_already_uploaded(session, file.filename, "837"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"File '{file.filename}' has already been uploaded. Please rename the file or upload a different one.",
+        )
+
     content = await file.read()
     raw = content.decode("utf-8", errors="replace")
 
@@ -200,12 +207,60 @@ async def _build_837_response(session: AsyncSession, claims, predictions, insert
     claim_lookup = {c.claim_id: c for c in claims}
     claim_results: list[dict] = []
 
-    for p in predictions:
+    # Batch-fetch denial patterns for all claims (performance optimization)
+    all_patterns: dict[int, list] = {}
+    try:
+        from app.services.denial_pattern_service import get_denial_patterns_batch
+        claims_data = []
+        pred_claim_ids = [p.claim_id for p in predictions]
+        for p in predictions:
+            c = claim_lookup.get(p.claim_id)
+            if c:
+                claims_data.append({
+                    "payer_name": c.payer_name or "",
+                    "cpt_codes": [sl.cpt_code.strip().upper() for sl in c.service_lines],
+                    "place_of_service": c.place_of_service,
+                })
+            else:
+                claims_data.append({"payer_name": "", "cpt_codes": []})
+        all_patterns = await get_denial_patterns_batch(session, claims_data)
+    except Exception as e:
+        logger.debug("Batch pattern retrieval skipped", error=str(e))
+
+    # Batch-fetch adaptive rules for all claims
+    all_adaptive_rules: dict[int, list] = {}
+    try:
+        from app.repositories import adaptive_rule_repo
+        adaptive_pairs = set()
+        for cd in claims_data:
+            payer = cd.get("payer_name", "")
+            for cpt in cd.get("cpt_codes", []):
+                if payer and cpt:
+                    adaptive_pairs.add((payer, cpt))
+        if adaptive_pairs:
+            rules_by_pair = await adaptive_rule_repo.get_active_rules_batch(
+                session, list(adaptive_pairs), min_confidence="MEDIUM",
+            )
+            for i, cd in enumerate(claims_data):
+                payer = cd.get("payer_name", "")
+                claim_rules_list = []
+                for cpt in cd.get("cpt_codes", []):
+                    claim_rules_list.extend(rules_by_pair.get((payer, cpt), []))
+                if claim_rules_list:
+                    all_adaptive_rules[i] = claim_rules_list
+    except Exception as e:
+        logger.debug("Adaptive rules batch fetch skipped", error=str(e))
+
+    for idx, p in enumerate(predictions):
         c = claim_lookup.get(p.claim_id)
         if not c:
             continue
 
-        v = await validate_claim(c, p)
+        v = await validate_claim(
+            c, p, session=session,
+            preloaded_patterns=all_patterns.get(idx),
+            preloaded_adaptive_rules=all_adaptive_rules.get(idx),
+        )
 
         patient_key = f"{c.patient_first_name} {c.patient_last_name}".strip().upper()
         if patient_key in high_volume_patients:
@@ -336,6 +391,13 @@ async def _build_837_response(session: AsyncSession, claims, predictions, insert
 @router.post("/835")
 async def upload_835(file: UploadFile = File(...), session: AsyncSession = Depends(get_db)):
     """Upload and parse an 835 Remittance Advice EDI file."""
+    # Block duplicate filename
+    if file.filename and await config_repo.file_already_uploaded(session, file.filename, "835"):
+        raise HTTPException(
+            status_code=409,
+            detail=f"File '{file.filename}' has already been uploaded. Please rename the file or upload a different one.",
+        )
+
     content = await file.read()
     raw = content.decode("utf-8", errors="replace")
 
@@ -361,6 +423,21 @@ async def upload_835(file: UploadFile = File(...), session: AsyncSession = Depen
     })
 
     await session.commit()
+
+    # Trigger adaptive rule mining in background
+    async def _mine_rules_bg():
+        try:
+            factory = get_session_factory()
+            async with factory() as bg_session:
+                from app.services.rule_miner import run_all_miners, update_payer_weights, update_cpt_risk_patterns
+                await update_payer_weights(bg_session)
+                await update_cpt_risk_patterns(bg_session)
+                await run_all_miners(bg_session)
+                await bg_session.commit()
+        except Exception as e:
+            logger.warning("Background rule mining failed", error=str(e))
+
+    asyncio.create_task(_mine_rules_bg())
 
     # Check auto-retrain trigger
     from app.services.model_trainer import (

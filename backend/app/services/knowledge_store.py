@@ -65,6 +65,14 @@ ISSUE_RELEVANT_CATEGORIES: dict[str, set[str] | None] = {
     "carc_167_dx_not_covered":   {"diagnosis"},
     "carc_197_prior_auth":       {"prior_auth"},
     "carc_204_not_covered":      {"cpt", "diagnosis"},
+    # Phase 3: denial intelligence issue types
+    "invalid_member_id":         {"subscriber_id"},
+    "dx_cpt_mismatch":           {"diagnosis", "cpt"},
+    # Phase 4: adaptive rule issue types
+    "timely_filing":             {"service_date", "frequency_code"},
+    "medical_necessity":         {"diagnosis", "modifier"},
+    "dx_not_covered":            {"diagnosis"},
+    "charge_threshold":          {"charge"},
 }
 
 

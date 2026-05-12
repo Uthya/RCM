@@ -46,6 +46,11 @@ CRITICAL_ISSUE_WEIGHTS: dict[str, float] = {
     "vague_sole_diagnosis": 0.15,
     "missing_dob": 0.05,
     "concentration_risk": 0.08,
+    "timely_filing": 0.15,
+    "medical_necessity": 0.12,
+    "dx_not_covered": 0.10,
+    "charge_threshold": 0.08,
+    "adaptive_rule": 0.08,
 }
 
 # ── Payer-specific modifier escalation ──
@@ -154,6 +159,8 @@ def classify_issues(issues: list[dict], payer_name: str = "") -> list[dict]:
             classified.append({"type": "concentration_risk", "weight": CRITICAL_ISSUE_WEIGHTS["concentration_risk"]})
         elif "missing patient date" in first_line or "missing patient dob" in first_line:
             classified.append({"type": "missing_dob", "weight": CRITICAL_ISSUE_WEIGHTS["missing_dob"]})
+        elif "[learned]" in first_line or "[advisory]" in first_line:
+            classified.append({"type": "adaptive_rule", "weight": CRITICAL_ISSUE_WEIGHTS["adaptive_rule"]})
         else:
             classified.append({"type": "other", "weight": 0.03})
 

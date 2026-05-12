@@ -37,6 +37,10 @@ def classify_issue_type(reason_text: str) -> str | None:
         return "missing_dob"
     if "missing" in r and "payer" in r and "identification" in r:
         return "missing_payer_id"
+    if "suspicious" in r and "subscriber" in r:
+        return "invalid_member_id"
+    if "diagnosis/procedure" in r and "mismatch" in r:
+        return "dx_cpt_mismatch"
     return None
 
 
@@ -188,6 +192,96 @@ def _get_cpt_info(code: str) -> dict | None:
     return None
 
 
+# ── Member ID validation ─────────────────────────────────────────────────────
+
+_PLACEHOLDER_IDS = {
+    "000000000", "111111111", "222222222", "333333333",
+    "444444444", "555555555", "666666666", "777777777",
+    "888888888", "999999999", "123456789", "000000001",
+    "UNKNOWN", "TEST", "TEMP", "NONE", "NA", "N/A", "TBD",
+    "SELF", "SELFPAY", "SELF PAY", "CASH",
+}
+
+_SUSPICIOUS_PATTERNS = [
+    re.compile(r"^(.)\1{5,}$"),        # 6+ repeating chars (AAAAAA, 000000)
+    re.compile(r"^TEST", re.I),        # Starts with TEST
+    re.compile(r"^TEMP", re.I),        # Starts with TEMP
+    re.compile(r"^0{3,}$"),            # All zeros (any length 3+)
+    re.compile(r"^X{3,}$", re.I),     # All X's
+]
+
+
+def _is_suspicious_member_id(member_id: str) -> bool:
+    """Check if a subscriber/member ID looks like a placeholder or test value."""
+    if not member_id or len(member_id) < 2:
+        return True  # Missing or too short
+    upper = member_id.upper().strip()
+    if upper in _PLACEHOLDER_IDS:
+        return True
+    for pattern in _SUSPICIOUS_PATTERNS:
+        if pattern.match(upper):
+            return True
+    return False
+
+
+# ── Diagnosis / Procedure mismatch detection ─────────────────────────────────
+
+# ICD-10 chapter prefixes -> compatible CPT categories
+_DX_CPT_COMPATIBILITY: dict[str, set[str]] = {
+    # Musculoskeletal (M00-M99)
+    "M": {"surgery_musculoskeletal", "pt_rehab", "radiology_dx", "em_office",
+           "em_hospital_inpatient", "em_er"},
+    # Circulatory (I00-I99)
+    "I": {"cardiac_dx", "surgery_cardio", "em_office", "em_hospital_inpatient",
+           "em_er", "radiology_dx"},
+    # Neoplasms (C00-D49)
+    "C": {"radiology_dx", "lab", "em_office", "em_hospital_inpatient", "em_er"},
+    # Mental/behavioral (F01-F99) — E/M only
+    "F": {"em_office", "em_hospital_inpatient", "em_consult"},
+    # Pregnancy (O00-O9A)
+    "O": {"em_office", "em_hospital_inpatient"},
+    # Injury/external causes (S/T)
+    "S": {"surgery_musculoskeletal", "em_er", "em_office", "radiology_dx"},
+    "T": {"surgery_musculoskeletal", "em_er", "em_office", "radiology_dx"},
+    # Screening/factors (Z00-Z99) — broad, only flag if paired with surgery
+    "Z": {"em_office", "em_consult", "lab", "radiology_dx"},
+}
+
+
+def _check_dx_cpt_mismatch(diagnosis_codes, service_lines) -> str | None:
+    """Check for obvious dx/CPT category mismatches. Returns description or None."""
+    if not diagnosis_codes or not service_lines:
+        return None
+
+    primary_dx = diagnosis_codes[0].upper().replace(".", "") if diagnosis_codes else ""
+    if not primary_dx:
+        return None
+    dx_chapter = primary_dx[0]
+
+    compatible_categories = _DX_CPT_COMPATIBILITY.get(dx_chapter)
+    if compatible_categories is None:
+        return None  # Unknown chapter — don't flag
+
+    mismatches = []
+    for sl in service_lines:
+        code = (sl.cpt_code.strip().upper() if hasattr(sl, "cpt_code")
+                else sl.get("cpt_code", "").strip().upper())
+        info = _get_cpt_info(code)
+        if not info:
+            continue
+        cpt_cat = None
+        for cat_name, cat_info in CPT_CATEGORIES.items():
+            if cat_info is info:
+                cpt_cat = cat_name
+                break
+        if cpt_cat and cpt_cat not in compatible_categories:
+            mismatches.append(f"{code} ({info['label']}) with dx {primary_dx}")
+
+    if not mismatches:
+        return None
+    return "Potential mismatch: " + "; ".join(mismatches[:3])
+
+
 # ── Per-claim issue detection ────────────────────────────────────────────────
 
 @dataclass
@@ -195,6 +289,7 @@ class ClaimIssue:
     """A single issue found on a claim, with reason + fix bullets."""
     reason: str          # Human-readable reason paragraph
     fixes: list[str]     # Actionable fix bullet points
+    source: str = "static"   # "static" | "adaptive" | "historical_pattern"
 
 
 @dataclass
@@ -210,17 +305,29 @@ class ClaimValidation:
     score_breakdown: dict = field(default_factory=dict)
     issues: list[ClaimIssue] = field(default_factory=list)
     top_factors: list[dict] = field(default_factory=list)
+    denial_patterns: list[dict] = field(default_factory=list)
 
 
-async def validate_claim(claim, prediction) -> ClaimValidation:
+async def validate_claim(
+    claim, prediction, session=None, preloaded_patterns=None,
+    preloaded_adaptive_rules=None,
+) -> ClaimValidation:
     """
     Run all validation rules on a single claim + prediction.
 
     Phase 1: Collect service line issues into buckets (invalid CPTs, missing
              modifiers grouped by category).
     Phase 2: Emit ONE issue per bucket (not per service line).
-    Phase 3: Claim-level checks (prior auth, NPI, DOB, payer, dx).
-    Phase 4: Enrich fixes with knowledge layer (historical fix reuse).
+    Phase 3: Claim-level checks (prior auth, NPI, DOB, payer, dx, member ID,
+             dx/CPT mismatch).
+    Phase 4: Enrich fixes with knowledge layer (historical fix reuse) +
+             historical denial pattern retrieval.
+    Phase 5: Adaptive learned rules from mined denial patterns.
+
+    Args:
+        session: Optional DB session for historical pattern queries.
+        preloaded_patterns: Pre-fetched DenialPattern list from batch retrieval.
+        preloaded_adaptive_rules: Pre-fetched AdaptiveRule list from batch retrieval.
     """
     patient_name = f"{claim.patient_first_name} {claim.patient_last_name}".strip() or "Unknown"
     payer = claim.payer_name or "Unknown"
@@ -394,6 +501,36 @@ async def validate_claim(claim, prediction) -> ClaimValidation:
             ],
         ))
 
+    # Suspicious / placeholder subscriber ID
+    subscriber_id = (claim.subscriber_id or "").strip()
+    if _is_suspicious_member_id(subscriber_id):
+        issues.append(ClaimIssue(
+            reason=(
+                f"Suspicious subscriber/member ID: '{subscriber_id}'\n"
+                f"This ID matches patterns commonly rejected by payers (CARC 31)"
+            ),
+            fixes=[
+                "Verify the subscriber ID against the insurance card",
+                "Check eligibility with the payer before submission",
+                f"Contact {payer} member services to confirm the correct ID format",
+            ],
+        ))
+
+    # Diagnosis / procedure category mismatch
+    mismatch = _check_dx_cpt_mismatch(claim.diagnosis_codes, claim.service_lines)
+    if mismatch:
+        issues.append(ClaimIssue(
+            reason=(
+                f"Diagnosis/procedure category mismatch\n"
+                f"{mismatch}"
+            ),
+            fixes=[
+                "Review diagnosis codes for clinical alignment with the billed procedure",
+                "Add a more specific diagnosis code supporting the procedure performed",
+                "Verify the CPT code matches the documented clinical indication",
+            ],
+        ))
+
     # ── Phase 4: Knowledge layer enrichment ──
     primary_cpt = ""
     if claim.service_lines:
@@ -417,6 +554,83 @@ async def validate_claim(claim, prediction) -> ClaimValidation:
     except Exception:
         pass  # Knowledge layer is optional; don't break validation
 
+    # Historical denial pattern retrieval
+    denial_patterns_data: list[dict] = []
+    patterns = preloaded_patterns  # Use pre-fetched if available
+    if patterns is None and session is not None:
+        try:
+            from app.services.denial_pattern_service import get_denial_patterns
+            cpt_codes = [sl.cpt_code.strip().upper() for sl in claim.service_lines]
+            patterns = await get_denial_patterns(
+                session, payer, cpt_codes,
+                place_of_service=claim.place_of_service,
+            )
+        except Exception:
+            patterns = None
+
+    if patterns:
+        from app.services.denial_pattern_service import pattern_to_dict
+        for pattern in patterns:
+            denial_patterns_data.append(pattern_to_dict(pattern))
+            # Only HIGH severity creates a validation issue
+            if pattern.severity == "HIGH" and not pattern.advisory_only:
+                carc_list = ", ".join(
+                    f"{c['code']} ({c['description']})"
+                    for c in pattern.top_carc_codes[:3]
+                )
+                fix_list = [f["fix"] for f in pattern.recommended_fixes[:2]]
+                issues.append(ClaimIssue(
+                    reason=(
+                        f"Historical denial pattern: {payer} + CPT {pattern.cpt_code} — "
+                        f"{int(pattern.denial_rate * 100)}% denial rate "
+                        f"({pattern.sample_count} claims)\n"
+                        f"Common denial codes: {carc_list}"
+                    ),
+                    fixes=fix_list or [
+                        "Review claim against payer-specific guidelines before submission"
+                    ],
+                ))
+
+    # ── Phase 5: Adaptive learned rules ──
+    adaptive_rules = preloaded_adaptive_rules
+    if adaptive_rules is None and session is not None:
+        try:
+            from app.repositories import adaptive_rule_repo
+            cpt_codes_list = [sl.cpt_code.strip().upper() for sl in claim.service_lines]
+            adaptive_rules = await adaptive_rule_repo.get_active_rules_for_payer(
+                session, payer, cpt_codes_list,
+            )
+        except Exception:
+            adaptive_rules = None
+
+    if adaptive_rules:
+        claim_cpts = {sl.cpt_code.strip().upper() for sl in claim.service_lines}
+        claim_dxs = set(claim.diagnosis_codes or [])
+        for rule in adaptive_rules:
+            if rule.operator_approved is False:
+                continue
+            if rule.cpt_code and rule.cpt_code not in claim_cpts:
+                continue
+            if rule.diagnosis_code and rule.diagnosis_code not in claim_dxs:
+                continue
+
+            if rule.severity == "ERROR" and rule.confidence_level == "HIGH":
+                issues.append(ClaimIssue(
+                    reason=f"[Learned] {rule.rule_description}\n"
+                           f"Based on {rule.denied_claims}/{rule.total_claims} denials "
+                           f"({int(rule.denial_rate * 100)}% rate, {rule.confidence_level} confidence)",
+                    fixes=[rule.fix_suggestion],
+                    source="adaptive",
+                ))
+            elif rule.severity == "WARNING" and rule.confidence_level in ("MEDIUM", "HIGH"):
+                issues.append(ClaimIssue(
+                    reason=f"[Advisory] {rule.rule_description}\n"
+                           f"Based on {rule.denied_claims}/{rule.total_claims} denials "
+                           f"({int(rule.denial_rate * 100)}% rate, {rule.confidence_level} confidence)",
+                    fixes=[rule.fix_suggestion],
+                    source="adaptive",
+                ))
+
     # Top factors from prediction
     top_factors = [
         {"name": f.display_name, "impact": f.impact}
@@ -431,6 +645,7 @@ async def validate_claim(claim, prediction) -> ClaimValidation:
         risk_level=prediction.risk_level,
         issues=issues,
         top_factors=top_factors,
+        denial_patterns=denial_patterns_data,
     )
 
 
@@ -461,9 +676,10 @@ def validation_to_dict(v: ClaimValidation) -> dict:
         "action_label": v.action_label,
         "score_breakdown": v.score_breakdown,
         "issues": [
-            {"reason": iss.reason, "fixes": iss.fixes}
+            {"reason": iss.reason, "fixes": iss.fixes, "source": iss.source}
             for iss in v.issues
         ],
         "top_factors": v.top_factors,
+        "denial_patterns": v.denial_patterns,
     }
     return result
